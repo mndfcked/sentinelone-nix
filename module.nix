@@ -128,7 +128,7 @@ in
           "${cfg.package}/opt/sentinelone/bin:/opt/sentinelone/bin"
           "${cfg.package}/opt/sentinelone/ebpfs:/opt/sentinelone/ebpfs"
           "${cfg.package}/opt/sentinelone/lib:/opt/sentinelone/lib"
-          "${cfg.package}/opt/sentinelone/ranger:/opt/sentinelone/ranger"
+       #   "${cfg.package}/opt/sentinelone/ranger:/opt/sentinelone/ranger"
         ];
       };
       wantedBy = [ "multi-user.target" ];
