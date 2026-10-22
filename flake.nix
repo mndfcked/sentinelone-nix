@@ -70,6 +70,10 @@
                 }
               );
               vendor-runtime = import ./tests/runtime-probe.nix { inherit pkgs; };
+              bootstrap = import ./tests/bootstrap.nix {
+                inherit lib pkgs;
+                inherit (self) nixosModules;
+              };
             };
           }
           // lib.optionalAttrs (inputs.treefmt-nix ? flakeModule) {

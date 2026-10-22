@@ -8,10 +8,22 @@ with lib;
 let
   cfg = config.services.sentinelone;
   customerId =
-    cfg.customerId or (
-      if cfg.email != null && cfg.serialNumber != null then "${cfg.email}-${cfg.serialNumber}" else null
-    );
-  hasCustomerId = customerId != null;
+    if cfg.customerId != null then
+      cfg.customerId
+    else if cfg.email != null && cfg.serialNumber != null then
+      "${cfg.email}-${cfg.serialNumber}"
+    else
+      null;
+  runtimePath = types.addCheck types.str (
+    value:
+    !builtins.hasContext value
+    && hasPrefix "/" value
+    && value != "/"
+    && value != "/nix/store"
+    && !hasPrefix "/nix/store/" value
+    && builtins.match "[^\n\r]*" value != null
+    && all (part: part != "" && part != "." && part != "..") (tail (splitString "/" value))
+  );
   mountPaths = [
     "bin"
     "ebpfs"
@@ -36,42 +48,14 @@ let
       Before = "umount.target";
     };
   };
-  initScript = pkgs.writeShellScriptBin "sentinelone-init.sh" ''
-    #!/bin/bash
-
-    mkdir -p ${cfg.dataDir}
-
-    # initialize the data directory
-    if [ -z "$(ls -A ${cfg.dataDir} 2>/dev/null)" ]; then
-      find "${cfg.package}/opt/sentinelone/" -mindepth 1 -maxdepth 1 ! -name "bin" ! -name "ebpfs" ! -name "ranger" -exec cp -r {} "${cfg.dataDir}/" \;
-
-      cat << EOF > ${cfg.dataDir}/configuration/install_config
-    S1_AGENT_MANAGEMENT_TOKEN=$(cat ${cfg.sentinelOneManagementTokenPath})
-    S1_AGENT_DEVICE_TYPE=desktop
-    S1_AGENT_AUTO_START=true
-    ${optionalString hasCustomerId "S1_AGENT_CUSTOMER_ID=${customerId}"}
-    EOF
-
-      cat << EOF > ${cfg.dataDir}/configuration/installation_params.json
-    {
-      "PACKAGE_TYPE": "deb",
-      "SERVICE_TYPE": "systemd"
+  initConfig = pkgs.writeText "sentinelone-bootstrap-config.json" (
+    builtins.toJSON {
+      data_dir = cfg.dataDir;
+      token_path = cfg.sentinelOneManagementTokenPath;
+      package = toString cfg.package;
+      customer_id = customerId;
     }
-    EOF
-      siteKey=$(cat ${cfg.sentinelOneManagementTokenPath} | base64 -d | ${getExe pkgs.jq} .site_key)
-      mgmtUrl=$(cat ${cfg.sentinelOneManagementTokenPath} | base64 -d | ${getExe pkgs.jq} .url)
-      cat << EOF > ${cfg.dataDir}/configuration/basic.conf
-    {
-        "mgmt_device-type": 1,
-        "mgmt_site-key": $siteKey,
-        "mgmt_url": $mgmtUrl
-    }
-    EOF
-
-      chown -R sentinelone:sentinelone ${cfg.dataDir}
-      chmod -R 0755 $(find ${cfg.dataDir} -group sentinelone)
-    fi
-  '';
+  );
   sentinelctlFhs = pkgs.buildFHSEnv {
     name = "sentinelctl";
     runScript = "/opt/sentinelone/bin/sentinelctl";
@@ -123,15 +107,17 @@ in
           example = "FTXYZWW";
         };
         sentinelOneManagementTokenPath = mkOption {
-          type = types.path;
+          type = runtimePath;
           description = ''
-            Path to file containing a SentinelOne management/site token. It is recommended to use a secret manager such a sops-nix or agenix.
+            Absolute runtime filename containing a SentinelOne management/site token.
+            Use a context-free string, for example a sops-nix or agenix secret path;
+            Nix path values and store-backed strings are rejected to avoid copying secrets into the store.
           '';
           example = "/run/secrets/s1_mgmt_token";
         };
         dataDir = mkOption {
-          type = types.path;
-          description = "Directory in which the agent stores its runtime data.";
+          type = runtimePath;
+          description = "Absolute runtime directory as a context-free string, never a Nix path or store-backed string.";
           default = "/var/lib/sentinelone";
         };
       };
@@ -174,16 +160,15 @@ in
     };
     users.groups.sentinelone = { };
 
-    systemd.tmpfiles.rules = [
-      "d ${cfg.dataDir} 0755 sentinelone sentinelone -"
-    ];
-
+    # Do not let tmpfiles create/chown unvalidated legacy state.
     systemd.services.sentinelone-init = {
-      wantedBy = [ "sentinelone.service" ];
       before = [ "sentinelone.service" ];
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${getExe initScript}";
+        User = "root";
+        Group = "root";
+        UMask = "0077";
+        ExecStart = "${getExe pkgs.python3} ${./bootstrap.py} ${initConfig}";
       };
     };
 
@@ -197,7 +182,21 @@ in
         what = cfg.dataDir;
         where = "/opt/sentinelone";
         type = "none";
-        options = "bind";
+        # Keep component mounts from propagating back into the persistent source.
+        options = "bind,rprivate";
+        requires = [ "sentinelone-init.service" ];
+        after = [ "sentinelone-init.service" ];
+        # This late, service-owned mount must not precede local-fs.target:
+        # its initializer waits for normal boot and runtime secret provisioning.
+        unitConfig = {
+          DefaultDependencies = "no";
+          Conflicts = "umount.target";
+          Before = "umount.target";
+          RequiresMountsFor = [
+            cfg.dataDir
+            "/opt"
+          ];
+        };
       }
     ]
     ++ map mkBindMount mountPaths;
@@ -205,6 +204,8 @@ in
     systemd.services.sentinelone = {
       enable = true;
       description = "SentinelOne";
+      requires = [ "sentinelone-init.service" ];
+      after = [ "sentinelone-init.service" ];
       path = [
         pkgs.coreutils-full
         pkgs.gawk
