@@ -77,17 +77,10 @@ services.sentinelone = {
   enable = false;
   sentinelOneManagementTokenPath = "/run/secrets/s1_mgmt_token";
   customerId = "example-customer-id";
-  package = pkgs.sentinelone.overrideAttrs (old: {
-    version = "sentinelone.package.version"; 
-    src = pkgs.fetchurl {
-        url = "https://url-to-sentinelone-package.deb";
-        hash = "sentinelone-hash";
-    };
-  });
 };
 ```
 
-overriding `package` to point to a URL where a SentinelOne `deb` is available.
+The module overlay provides `pkgs.sentinelone`. The `services.sentinelone.package` option can be overridden with `overrideAttrs` for a locally sourced package. See the [Linux package and upgrade decision](docs/linux-package-upgrade-decision.md) for the current candidate, provenance limits, and local example. Keep the service disabled; the candidate has not been validated for production.
 
 `sentinelOneManagementTokenPath` could be from a [sops-nix](https://github.com/Mic92/sops-nix) secret such as
 
