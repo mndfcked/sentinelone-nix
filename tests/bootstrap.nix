@@ -40,12 +40,37 @@ let
     mkdir -p $out/opt/sentinelone/{bin,ebpfs,ranger,lib}
     install -m 755 ${agent} $out/opt/sentinelone/bin/sentinelone-agent
   '';
+  backingRoot = "/var/lib/bootstrap-backing-test";
+  delayedBackingNode = lib.recursiveUpdate (node package) {
+    services.sentinelone.dataDir = "${backingRoot}/state";
+    systemd.mounts = [
+      {
+        what = "tmpfs";
+        where = backingRoot;
+        type = "tmpfs";
+        options = "mode=0755,size=64m";
+        requires = [ "sentinelone-test-backing-delay.service" ];
+        after = [ "sentinelone-test-backing-delay.service" ];
+        unitConfig.DefaultDependencies = "no";
+      }
+    ];
+    systemd.services.sentinelone-test-backing-delay = {
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.coreutils}/bin/sleep 1";
+      };
+    };
+    systemd.services.sentinelone-init.serviceConfig.ExecStartPre = lib.mkAfter [
+      "${pkgs.util-linux}/bin/mountpoint -q ${backingRoot}"
+    ];
+  };
 in
 pkgs.testers.nixosTest {
   name = "sentinelone-bootstrap";
   nodes = {
     machine = node package;
     badSeed = node badSeed;
+    lateBacking = delayedBackingNode;
   };
   testScript = ''
     import base64
@@ -61,8 +86,8 @@ pkgs.testers.nixosTest {
     def guest(code, node=machine):
         return node.succeed("python3 -c " + shlex.quote(code))
 
-    def write_token(value):
-        guest("from pathlib import Path; p = Path('/run/bootstrap-token'); p.write_text(" + repr(value) + "); p.chmod(0o600)")
+    def write_token(value, node=machine):
+        guest("from pathlib import Path; p = Path('/run/bootstrap-token'); p.write_text(" + repr(value) + "); p.chmod(0o600)", node)
 
     def encoded(value):
         return base64.b64encode(json.dumps(value).encode()).decode()
@@ -258,5 +283,20 @@ pkgs.testers.nixosTest {
     guest("from pathlib import Path; Path(" + repr(parent) + ").mkdir(mode=0o755); p = Path('/run/bootstrap-token'); p.write_text(" + repr(token) + "); p.chmod(0o600)", badSeed)
     badSeed.fail("systemctl start sentinelone.service")
     guest("from pathlib import Path; assert not Path(" + repr(root) + ").exists(); assert not Path(" + repr(lock) + ").exists(); assert not Path('/run/sentinelone-started').exists()", badSeed)
+
+    lateRoot = "/var/lib/bootstrap-backing-test/state"
+    lateParent = "/var/lib/bootstrap-backing-test"
+    lateMarker = lateRoot + "/.sentinelone-bootstrap.json"
+    lateBacking.wait_for_unit("multi-user.target")
+    guest("from pathlib import Path; p = Path(" + repr(lateParent) + "); p.mkdir(mode=0o755, exist_ok=True); p.chmod(0o755)", lateBacking)
+    write_token(token + "\n", lateBacking)
+    lateBacking.fail("mountpoint -q " + shlex.quote(lateParent))
+    lateBacking.succeed("systemctl start sentinelone-init.service")
+    lateBacking.succeed("mountpoint -q " + shlex.quote(lateParent))
+    lateBacking.succeed("test -f " + shlex.quote(lateMarker))
+    lateBacking.succeed("test \"$(stat -f -c %T " + shlex.quote(lateRoot) + ")\" = tmpfs")
+    lateBacking.succeed("systemctl show -P Result sentinelone-init.service | grep -Fx success")
+    guest("import json; from pathlib import Path; p = Path(" + repr(lateMarker) + "); m = json.loads(p.read_text()); assert m == {'schema': 1, 'package': '${package}'}; assert p.stat().st_uid == 0; assert p.stat().st_mode & 0o777 == 0o600; assert Path(" + repr(lateRoot) + ").stat().st_dev == Path(" + repr(lateParent) + ").stat().st_dev", lateBacking)
+    lateBacking.fail("systemctl is-active --quiet sentinelone.service")
   '';
 }

@@ -163,6 +163,7 @@ in
     # Do not let tmpfiles create/chown unvalidated legacy state.
     systemd.services.sentinelone-init = {
       before = [ "sentinelone.service" ];
+      unitConfig.RequiresMountsFor = [ cfg.dataDir ];
       serviceConfig = {
         Type = "oneshot";
         User = "root";
