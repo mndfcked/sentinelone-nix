@@ -6,9 +6,42 @@ Package and module to use SentinelOne on NixOS. Based on the SentinelOne package
 
 ## Production status
 
-The production module remains the audited upstream integration: it runs package binaries from the Nix store and uses read-only bind mounts. This branch has not made the integration safe to re-enable. Keep `services.sentinelone.enable` disabled; production automatic upgrades are unsupported.
+The store-managed module still runs package binaries from the immutable Nix store and uses read-only component bind mounts. Bootstrap hardening does not make the integration ready to re-enable. Keep `services.sentinelone.enable` disabled; production automatic upgrades remain unsupported.
 
-Deployment blockers remain in the existing code: token-bearing initialization files receive mode `0755`, initialization can leave partial state, the customer ID fallback is defective, and upgrade-state handling remains unresolved. The runtime probe below does not fix those defects or remediate any prior credential exposure. Real vendor-package validation remains pending. Any such test must run in a disposable VM without a token or network access. Production auto-upgrade remains unsupported pending an updater contract, provenance checks, and vendor validation.
+Bootstrap now protects generated credentials, publishes initialized state atomically, and handles the legacy customer ID fallback. It refuses unknown existing state and package mismatches. These changes do not remediate any prior credential exposure. A vendor updater contract, update provenance checks, and real vendor-package validation remain deployment blockers. Any vendor-package smoke test must run in a disposable VM without a token or network access.
+
+## Store-managed bootstrap
+
+Initialization validates the package seed and runtime token before creating persistent bootstrap state. It copies into a root-owned `0700` staging directory beside `dataDir`, preserves copied directory permissions and executable bits, and writes generated credential files as root-owned `0600` files. A serialized root-only lock sits outside the installation. The helper publishes the completed tree with a same-filesystem rename. The base mount, read-only component mounts, and daemon all require successful initialization.
+
+`sentinelOneManagementTokenPath` and `dataDir` accept canonical absolute runtime strings outside `/nix/store`. Nix path values and strings with store context are rejected to prevent copying credentials or persistent data into the store. A secret manager's runtime `.path` string remains supported. The token source must be a regular file with no group/other permissions, such as mode `0400` or `0600`. Runtime secret-manager symlinks and private files owned by the configured secret recipient are supported. The initializer never fixes the source file's permissions or ownership.
+
+The token must contain single-line base64 encoding of one JSON object with nonempty string `url` and `site_key` fields. One trailing newline in the token file is accepted. Embedded token newlines and control characters in decoded fields are rejected. Token bytes are read only at initialization and never passed through command arguments, environment variables, or diagnostics.
+
+The destination may be absent or an empty root-owned directory. Its parent must already exist. The destination and its ancestors must be real root-owned directories without group/other write access; symlinks and nested mounts are refused. The base bind mount uses private propagation so component mounts do not appear inside the persistent source tree.
+
+### Existing state and package changes
+
+This is a breaking change for existing installations: nonempty state without a valid `.sentinelone-bootstrap.json` marker is refused unchanged. Legacy or partial installations are never adopted, deleted, migrated, or re-enrolled automatically. For example, an old unmarked `/var/lib/sentinelone` prevents the daemon and its mounts from starting. Inspect the refusal with:
+
+```sh
+journalctl -u sentinelone-init.service
+```
+
+Preserve the existing tree and request an explicit operator migration or upgrade plan. Do not delete state or add a marker to bypass the refusal. Interrupted staging directories also require operator review; the helper only cleans staging created by its own invocation.
+
+The marker records a schema and the exact store package identity. A matching marker permits startup without rereading the original token, including after enrollment consumes its bootstrap files. A different package identity or malformed marker prevents startup without changing existing contents, permissions, or ownership. The marker does not verify a vendor signature, enrollment health, or the installed vendor version.
+
+### Bootstrap regression checks
+
+Run each check separately from the repository root:
+
+```sh
+nix build path:.#checks.x86_64-linux.bootstrap --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.vmtest --no-link --no-write-lock-file -L
+```
+
+These checks use synthetic packages and fake runtime tokens. They cover credential confidentiality, failed initialization and retry, preservation of refused state, marker/package compatibility, service and mount dependencies, and modern and deprecated customer ID options. The fixtures do not validate real vendor enrollment or updates.
 
 ## Development runtime probe
 
@@ -62,6 +95,7 @@ overriding `package` to point to a URL where a SentinelOne `deb` is available.
 sops = {
   secrets.s1_mgmt_token = {
     sopsFile = ../../secrets/sentinelone.yaml;
+    mode = "0600";
   };
 };
 services.sentinelone = {
