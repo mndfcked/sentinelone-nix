@@ -3,8 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
+
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
+
+    # Only used during development, can be disabled by flake users like this:
+    #   sentinelone.inputs.treefmt-nix.follows = "";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -24,8 +34,8 @@
       {
         imports = [
           inputs.flake-parts.flakeModules.easyOverlay
-          inputs.treefmt-nix.flakeModule
-        ];
+        ]
+        ++ (if inputs.treefmt-nix ? flakeModule then [ inputs.treefmt-nix.flakeModule ] else [ ]);
         systems = [
           "x86_64-linux"
         ];
@@ -37,30 +47,37 @@
             ...
           }:
           {
-            treefmt = {
-              programs.nixfmt = {
-                enable = true;
-                package = pkgs.nixfmt-rfc-style;
-              };
-              programs.mdformat.enable = true;
-            };
-
             overlayAttrs = {
               inherit (config.packages) sentinelone;
             };
 
             packages = {
               sentinelone = pkgs.callPackage ./package.nix { };
+              # VM test using the real agent package, not publicly fetchable
+              vmtest = import ./test.nix {
+                inherit lib pkgs;
+                inherit (self) nixosModules;
+                stub = false;
+              };
             };
 
             checks = {
               default = self.checks.${system}.vmtest;
               vmtest = (
                 import ./test.nix {
-                  inherit pkgs;
+                  inherit lib pkgs;
                   inherit (self) nixosModules;
                 }
               );
+            };
+          }
+          // lib.optionalAttrs (inputs.treefmt-nix ? flakeModule) {
+            treefmt = {
+              programs.nixfmt = {
+                enable = true;
+                package = pkgs.nixfmt;
+              };
+              programs.mdformat.enable = true;
             };
           };
 

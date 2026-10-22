@@ -1,24 +1,51 @@
 {
+  lib,
   pkgs,
   nixosModules,
+  stub ? true,
 }:
-pkgs.nixosTest {
-  name = "sentinelone";
+let
+  agentStub = pkgs.writeShellScript "sentinelone-agent" ''
+    while true; do
+      ${pkgs.systemd}/bin/systemd-notify WATCHDOG=1 || true
+      sleep 10
+    done
+  '';
+  # fake agent package providing everything module.nix expects from cfg.package
+  stubPackage = pkgs.runCommand "sentinelone-stub" { } ''
+    mkdir -p $out/opt/sentinelone/{bin,ebpfs,ranger,lib,configuration}
+    install -m 755 ${agentStub} $out/opt/sentinelone/bin/sentinelone-agent
+    install -m 755 ${pkgs.writeShellScript "sentinelctl" ""} $out/opt/sentinelone/bin/sentinelctl
+  '';
+  defaultTestAttrs = {
+    imports = [
+      nixosModules.default
+      "${pkgs.path}/nixos/tests/common/user-account.nix"
+    ];
+    users.users.alice.extraGroups = [ "wheel" ];
+    security.sudo.wheelNeedsPassword = false;
+    services.sentinelone = {
+      enable = true;
+      # base64 encoded config with fake site key
+      sentinelOneManagementTokenPath = pkgs.writeText "s1_token" "eyJ1cmwiOiAiaHR0cHM6Ly9zZW50aW5lbG9uZS1wcm9ncmFtLnNlbnRpbmVsb25lLm5ldCIsICJz
+aXRlX2tleSI6ICJmM2M4N2IyZTlhMWQ0YzZlIn0KCg==";
+    }
+    // lib.optionalAttrs stub { package = stubPackage; };
+  };
+in
+pkgs.testers.nixosTest {
+  name = "sentinelone" + lib.optionalString stub "-stub";
   nodes = {
-    sentinelone = {
-      imports = [
-        nixosModules.default
-        "${pkgs.path}/nixos/tests/common/user-account.nix"
-      ];
-      users.users.alice.extraGroups = [ "wheel" ];
-      security.sudo.wheelNeedsPassword = false;
+    withoutCustomerId = defaultTestAttrs;
+
+    withCustomerId = lib.recursiveUpdate defaultTestAttrs {
+      services.sentinelone.customerId = "goon@goon.ventures-42069B00B5";
+    };
+
+    withDepracatedOptions = lib.recursiveUpdate defaultTestAttrs {
       services.sentinelone = {
-        enable = true;
         email = "goon@goon.ventures";
         serialNumber = "42069B00B5";
-        # base64 encoded config with fake site key
-        sentinelOneManagementTokenPath = pkgs.writeText "s1_token" "eyJ1cmwiOiAiaHR0cHM6Ly9zZW50aW5lbG9uZS1wcm9ncmFtLnNlbnRpbmVsb25lLm5ldCIsICJz
-aXRlX2tleSI6ICJmM2M4N2IyZTlhMWQ0YzZlIn0KCg==";
       };
     };
   };
@@ -26,6 +53,15 @@ aXRlX2tleSI6ICJmM2M4N2IyZTlhMWQ0YzZlIn0KCg==";
   testScript = ''
     start_all()
 
-    sentinelone.wait_for_unit("sentinelone.service") 
+    withoutCustomerId.wait_for_unit("sentinelone.service")
+    withoutCustomerId.succeed("mountpoint -q /opt/sentinelone")
+    withoutCustomerId.succeed("touch /opt/sentinelone/lib/.write-test && rm /opt/sentinelone/lib/.write-test")
+    withoutCustomerId.fail("touch /opt/sentinelone/bin/.write-test")
+    withoutCustomerId.fail("grep -q sentinelone /etc/fstab")
+    withoutCustomerId.fail("journalctl -b --grep='ordering cycle' --quiet")
+
+    withCustomerId.wait_for_unit("sentinelone.service")
+
+    withDepracatedOptions.wait_for_unit("sentinelone.service")
   '';
 }

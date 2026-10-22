@@ -7,6 +7,35 @@
 with lib;
 let
   cfg = config.services.sentinelone;
+  customerId =
+    cfg.customerId or (
+      if cfg.email != null && cfg.serialNumber != null then "${cfg.email}-${cfg.serialNumber}" else null
+    );
+  hasCustomerId = customerId != null;
+  mountPaths = [
+    "bin"
+    "ebpfs"
+    "ranger"
+  ];
+  mkBindMount = path: {
+    what = "${cfg.package}/opt/sentinelone/${path}";
+    where = "/opt/sentinelone/${path}";
+    type = "none";
+    options = "bind,ro";
+    requires = [
+      "opt-sentinelone.mount"
+      "sentinelone-init.service"
+    ];
+    after = [
+      "opt-sentinelone.mount"
+      "sentinelone-init.service"
+    ];
+    unitConfig = {
+      DefaultDependencies = "no";
+      Conflicts = "umount.target";
+      Before = "umount.target";
+    };
+  };
   initScript = pkgs.writeShellScriptBin "sentinelone-init.sh" ''
     #!/bin/bash
 
@@ -14,13 +43,13 @@ let
 
     # initialize the data directory
     if [ -z "$(ls -A ${cfg.dataDir} 2>/dev/null)" ]; then
-      find "${cfg.package}/opt/sentinelone/" -mindepth 1 -maxdepth 1 ! -name "bin" ! -name "ebpfs" ! -name "lib" ! -name "ranger" -exec cp -r {} "${cfg.dataDir}/" \;
+      find "${cfg.package}/opt/sentinelone/" -mindepth 1 -maxdepth 1 ! -name "bin" ! -name "ebpfs" ! -name "ranger" -exec cp -r {} "${cfg.dataDir}/" \;
 
       cat << EOF > ${cfg.dataDir}/configuration/install_config
     S1_AGENT_MANAGEMENT_TOKEN=$(cat ${cfg.sentinelOneManagementTokenPath})
     S1_AGENT_DEVICE_TYPE=desktop
     S1_AGENT_AUTO_START=true
-    S1_AGENT_CUSTOMER_ID=${cfg.email}-${cfg.serialNumber}
+    ${optionalString hasCustomerId "S1_AGENT_CUSTOMER_ID=${customerId}"}
     EOF
 
       cat << EOF > ${cfg.dataDir}/configuration/installation_params.json
@@ -40,8 +69,31 @@ let
     EOF
 
       chown -R sentinelone:sentinelone ${cfg.dataDir}
+      chmod -R 0755 $(find ${cfg.dataDir} -group sentinelone)
     fi
   '';
+  sentinelctlFhs = pkgs.buildFHSEnv {
+    name = "sentinelctl";
+    runScript = "/opt/sentinelone/bin/sentinelctl";
+  };
+  sentinelctlScript = pkgs.writeShellApplication {
+    name = "sentinelctl";
+    runtimeInputs = with pkgs; [
+      config.systemd.package
+      util-linux
+      sentinelctlFhs
+    ];
+    text = ''
+      if [ "$EUID" -ne 0 ]; then
+        echo "$0 must be run with root privileges"
+        exit 1
+      fi
+
+      exec nsenter --all \
+        --target "$(systemctl show -P MainPID sentinelone)" \
+        -- sentinelctl "$@"
+    '';
+  };
 in
 {
   options = {
@@ -49,20 +101,37 @@ in
       sentinelone = {
         enable = mkEnableOption "SentinelOne Service";
         package = mkPackageOption pkgs "sentinelone" { };
+
+        customerId = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = ''
+            Set a customer specific identifier for the host. It is common practice to set this as your email and serial number separated by a hyphen.
+          '';
+          example = "me@gmail.com-FTXYZWW";
+        };
         email = mkOption {
-          type = types.str;
+          type = types.nullOr types.str;
+          default = null;
+          description = "Your email address, used to construct a unique customer ID. Deprecated in favour of customerId.";
           example = "me@gmail.com";
         };
         serialNumber = mkOption {
-          type = types.str;
+          type = types.nullOr types.str;
+          default = null;
+          description = "Your host machines serial number, used to construct a unique customer ID. Deprecated in favour of customerId.";
           example = "FTXYZWW";
         };
         sentinelOneManagementTokenPath = mkOption {
           type = types.path;
+          description = ''
+            Path to file containing a SentinelOne management/site token. It is recommended to use a secret manager such a sops-nix or agenix.
+          '';
           example = "/run/secrets/s1_mgmt_token";
         };
         dataDir = mkOption {
           type = types.path;
+          description = "Directory in which the agent stores its runtime data.";
           default = "/var/lib/sentinelone";
         };
       };
@@ -70,6 +139,32 @@ in
   };
 
   config = mkIf cfg.enable {
+    warnings =
+      optional (cfg.email != null) "services.sentinelone.email is deprecated in favour of customerId."
+      ++ optional (
+        cfg.serialNumber != null
+      ) "services.sentinelone.serialNumber is deprecated in favour of customerId.";
+
+    assertions = [
+      {
+        assertion = (cfg.customerId != null) -> (cfg.email == null && cfg.serialNumber == null);
+        message = ''
+          You cannot use services.sentinelone.customerId with the deprecated services.sentinelone.email and services.sentinelone.serialNumber options.
+        '';
+      }
+      {
+        assertion = (cfg.email != null) -> (cfg.serialNumber != null);
+        message = ''
+          services.sentinelone.email requires services.sentinelone.serialNumber to also be set.
+        '';
+      }
+      {
+        assertion = (cfg.serialNumber != null) -> (cfg.email != null);
+        message = ''
+          services.sentinelone.serialNumber requires services.sentinelone.email to also be set.
+        '';
+      }
+    ];
 
     users.users.sentinelone = {
       isSystemUser = true;
@@ -79,6 +174,10 @@ in
     };
     users.groups.sentinelone = { };
 
+    systemd.tmpfiles.rules = [
+      "d ${cfg.dataDir} 0755 sentinelone sentinelone -"
+    ];
+
     systemd.services.sentinelone-init = {
       wantedBy = [ "sentinelone.service" ];
       before = [ "sentinelone.service" ];
@@ -87,6 +186,21 @@ in
         ExecStart = "${getExe initScript}";
       };
     };
+
+    environment.systemPackages = [
+      cfg.package
+      sentinelctlScript
+    ];
+
+    systemd.mounts = [
+      {
+        what = cfg.dataDir;
+        where = "/opt/sentinelone";
+        type = "none";
+        options = "bind";
+      }
+    ]
+    ++ map mkBindMount mountPaths;
 
     systemd.services.sentinelone = {
       enable = true;
@@ -104,32 +218,22 @@ in
           "uptrack-prefetch.service"
           "uptrack.service"
         ];
+        RefuseManualStop = "yes";
         StartLimitInterval = "90";
         StartLimitBurst = "4";
+        RequiresMountsFor = map (path: "/opt/sentinelone/${path}") mountPaths;
       };
       serviceConfig = {
-        Type = "forking";
-        ExecStart = "${cfg.package}/bin/sentinelctl control run";
+        Type = "exec";
+        ExecStart = "${cfg.package}/opt/sentinelone/bin/sentinelone-agent";
         WorkingDirectory = "/opt/sentinelone/bin";
-        SyslogIdentifier = "${cfg.dataDir}/log";
-        WatchdogSec = "5s";
-        Restart = "always";
+        WatchdogSec = "30s";
+        Restart = "on-failure";
         RestartSec = "4";
-        RefuseManualStop = "yes";
-        MemoryMax = "18446744073709543424";
-        ExecStop = "${cfg.package}/bin/sentinelctl control shutdown";
+        ExecStop = "${lib.getExe sentinelctlFhs} control stop";
+        MemoryAccounting = "yes";
         NotifyAccess = "all";
-        KillMode = "process";
         TasksMax = "infinity";
-        BindPaths = [
-          "${cfg.dataDir}:/opt/sentinelone"
-        ];
-        BindReadOnlyPaths = [
-          "${cfg.package}/opt/sentinelone/bin:/opt/sentinelone/bin"
-          "${cfg.package}/opt/sentinelone/ebpfs:/opt/sentinelone/ebpfs"
-          "${cfg.package}/opt/sentinelone/lib:/opt/sentinelone/lib"
-       #   "${cfg.package}/opt/sentinelone/ranger:/opt/sentinelone/ranger"
-        ];
       };
       wantedBy = [ "multi-user.target" ];
     };
