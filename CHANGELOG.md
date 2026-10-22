@@ -8,3 +8,4 @@
 - Breaking: refuse nonempty unmarked or malformed state and store-package mismatches without automatic migration, deletion, or re-enrollment. Interrupted staging requires operator review. Completion metadata records schema and package identity only, not enrollment health or vendor authenticity.
 - Breaking: token and data paths must be absolute runtime strings without Nix store context. Readable token sources are refused without permission changes; private secret-manager symlink targets remain supported.
 - Fixed the deprecated email/serial-number customer ID fallback and added synthetic VM regressions for bootstrap failure, state preservation, restart, mount dependencies, and customer ID compatibility. Production auto-upgrade and real vendor validation remain unsupported.
+- Bootstrap initialization waits for the filesystem backing `dataDir`, preventing state writes to an underlay directory before the mount is ready.
