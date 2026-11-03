@@ -5,22 +5,34 @@ on:
   schedule:
     - cron: '0 8 * * 6'
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   lockfile:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
-      - name: Update flake.lock
-        uses: DeterminateSystems/update-flake-lock@v28
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.FLAKE_LOCK_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: Check for updater token
+        env:
+          FLAKE_LOCK_TOKEN_PRESENT: ${{ secrets.FLAKE_LOCK_TOKEN != '' }}
+        run: |
+          if [ "$FLAKE_LOCK_TOKEN_PRESENT" != "true" ]; then
+            echo "::error::Repository secret FLAKE_LOCK_TOKEN is required for flake lock updates."
+            exit 1
+          fi
+      - name: Update flake.lock
+        uses: DeterminateSystems/update-flake-lock@da03c0f078bc4b2c37ee4f7e072d34bf8f188bb3 # v29
+        env:
+          OTEL_SDK_DISABLED: "true"
+        with:
+          token: ${{ secrets.FLAKE_LOCK_TOKEN }}
           pr-title: "Update flake.lock" # Title of PR to be created
           pr-labels: | # Labels to be set on the PR
             dependencies

@@ -74,6 +74,7 @@
                 inherit lib pkgs;
                 inherit (self) nixosModules;
               };
+              ci-policy = import ./tests/ci-policy.nix { inherit pkgs; };
             };
           }
           // lib.optionalAttrs (inputs.treefmt-nix ? flakeModule) {
