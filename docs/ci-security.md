@@ -6,7 +6,7 @@ Both `.github/workflows/ci.yaml` and `.github/workflows/update-flake-lock.yaml` 
 
 The lock updater runs on its weekly schedule or through `workflow_dispatch`. Its preflight passes only a boolean indicating whether `FLAKE_LOCK_TOKEN` exists, then fails with a fixed error if it is absent. The secret value goes only to the updater action's `token` input. There is no fallback to `GITHUB_TOKEN`, and the writer token is not set in workflow or job environment variables.
 
-The repository secret list was empty at the last inspection. The live updater therefore remains blocked until the secret is provisioned. No token value was read, and its configured scope has not been verified. A successful run would not prove that the token has no extra permissions.
+Track secret provisioning, token-scope confirmation, and evidence from an actual updater workflow run in the [implementation PR #7](https://github.com/mndfcked/sentinelone-nix/pull/7). The preflight checks only whether `FLAKE_LOCK_TOKEN` exists. Before relying on the updater, the operator must confirm that the fine-grained token is restricted to this repository and has only the permissions listed below; GitHub grants Metadata read implicitly. A successful branch push and PR creation show that the token can perform those actions, but do not prove it lacks additional permissions. Never read the token value or include token bytes in logs, issues, or chat.
 
 Use a fine-grained token limited to this repository, with Contents read/write and Pull requests read/write; GitHub grants Metadata read implicitly. Do not grant other scopes. The Contents write permission can change repository files beyond `flake.lock`.
 

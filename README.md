@@ -12,7 +12,7 @@ Bootstrap now protects generated credentials, publishes initialized state atomic
 
 ## CI and lock updates
 
-See [CI security](docs/ci-security.md) for the pinned checkout, installer, and updater commits, advisory audit, accepted residual risks, and pending live-token verification.
+See [CI security](docs/ci-security.md) for the pinned checkout, installer, and updater commits, advisory audit, accepted residual risks, and token provisioning and verification.
 
 ## Store-managed bootstrap
 
