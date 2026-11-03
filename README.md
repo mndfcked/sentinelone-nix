@@ -10,6 +10,10 @@ The store-managed module still runs package binaries from the immutable Nix stor
 
 Bootstrap now protects generated credentials, publishes initialized state atomically, and handles the legacy customer ID fallback. It refuses unknown existing state and package mismatches. These changes do not remediate any prior credential exposure. A vendor updater contract, update provenance checks, and real vendor-package validation remain deployment blockers. Any vendor-package smoke test must run in a disposable VM without a token or network access.
 
+## CI and lock updates
+
+See [CI security](docs/ci-security.md) for the pinned checkout, installer, and updater commits, advisory audit, accepted residual risks, and pending live-token verification.
+
 ## Store-managed bootstrap
 
 Initialization validates the package seed and runtime token before creating persistent bootstrap state. It copies into a root-owned `0700` staging directory beside `dataDir`, preserves copied directory permissions and executable bits, and writes generated credential files as root-owned `0600` files. A serialized root-only lock sits outside the installation. The helper publishes the completed tree with a same-filesystem rename. The base mount, read-only component mounts, and daemon all require successful initialization.
