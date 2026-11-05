@@ -75,6 +75,22 @@
                 inherit (self) nixosModules;
               };
               ci-policy = import ./tests/ci-policy.nix { inherit pkgs; };
+              native-runtime = import ./tests/native-runtime.nix { inherit pkgs; };
+              native-options = import ./tests/native-options.nix {
+                inherit lib pkgs;
+                inherit (self) nixosModules;
+              };
+              native-backend = import ./tests/native-backend.nix {
+                inherit lib pkgs;
+                inherit (self) nixosModules;
+              };
+              native-controller = pkgs.runCommand "native-controller-faults" { } ''
+                ${pkgs.python3}/bin/python3 -B ${./tests/native-controller.py} ${./native-controller.py}
+                touch $out
+              '';
+              native-observer = pkgs.runCommand "native-observer" { } ''
+                ${pkgs.python3}/bin/python3 -B ${./tests/native-vendor-observer.py} mount-smoke > $out
+              '';
             };
           }
           // lib.optionalAttrs (inputs.treefmt-nix ? flakeModule) {
