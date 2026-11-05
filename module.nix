@@ -2,6 +2,7 @@
   lib,
   pkgs,
   config,
+  options,
   ...
 }:
 with lib;
@@ -85,6 +86,16 @@ in
       sentinelone = {
         enable = mkEnableOption "SentinelOne Service";
         package = mkPackageOption pkgs "sentinelone" { };
+        vendorManagedUpdates = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            EXPERIMENTAL native, unenrolled offline platform using the original
+            package.src DEB and vendor-managed mutable payload. Native support
+            for the default v24 package is not established. No enrollment,
+            authenticated upgrades, or production managed-update support is claimed.
+          '';
+        };
 
         customerId = mkOption {
           type = types.nullOr types.str;
@@ -107,9 +118,11 @@ in
           example = "FTXYZWW";
         };
         sentinelOneManagementTokenPath = mkOption {
-          type = runtimePath;
+          type = types.nullOr runtimePath;
+          default = null;
           description = ''
-            Absolute runtime filename containing a SentinelOne management/site token.
+            Required in legacy mode; must be null in experimental native mode.
+            Absolute runtime filename
             Use a context-free string, for example a sops-nix or agenix secret path;
             Nix path values and store-backed strings are rejected to avoid copying secrets into the store.
           '';
@@ -124,120 +137,186 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
-    warnings =
-      optional (cfg.email != null) "services.sentinelone.email is deprecated in favour of customerId."
-      ++ optional (
-        cfg.serialNumber != null
-      ) "services.sentinelone.serialNumber is deprecated in favour of customerId.";
+  config = mkMerge [
+    {
+      assertions = [
+        {
+          assertion = !(cfg.enable && cfg.vendorManagedUpdates) || options.system ? preSwitchChecks;
+          message = "SentinelOne requires NixOS system.preSwitchChecks for a safe pre-stop mode-transition veto.";
+        }
+      ];
+    }
+    (optionalAttrs (options.system ? preSwitchChecks) {
+      # This guard deliberately has no package/source/runtime dependency.
+      system.preSwitchChecks.sentinelone =
+        let
+          guard = pkgs.writeText "sentinelone-preflight.json" (
+            builtins.toJSON {
+              schema = 1;
+              enabled = cfg.enable;
+              native = cfg.vendorManagedUpdates;
+              data_dir = cfg.dataDir;
+            }
+          );
+        in
+        ''${getExe pkgs.python3} ${./native-controller.py} preflight ${guard} --system "$1"'';
+    })
+    (mkIf cfg.enable {
+      assertions = [
+        {
+          assertion = cfg.vendorManagedUpdates || cfg.sentinelOneManagementTokenPath != null;
+          message = "Legacy services.sentinelone requires a non-null sentinelOneManagementTokenPath.";
+        }
+        {
+          assertion = !cfg.vendorManagedUpdates || cfg.sentinelOneManagementTokenPath == null;
+          message = "Experimental native SentinelOne is unenrolled: sentinelOneManagementTokenPath must be null.";
+        }
+        {
+          assertion =
+            !cfg.vendorManagedUpdates
+            || (cfg.customerId == null && cfg.email == null && cfg.serialNumber == null);
+          message = "Experimental native SentinelOne rejects customerId, email, and serialNumber enrollment settings.";
+        }
+        {
+          assertion =
+            !cfg.vendorManagedUpdates
+            || (
+              cfg.dataDir != "/var/lib/sentinelone-nix"
+              && !hasPrefix "/var/lib/sentinelone-nix/" cfg.dataDir
+              && !hasPrefix "${cfg.dataDir}/" "/var/lib/sentinelone-nix"
+            );
+          message = "Native SentinelOne dataDir must not overlap /var/lib/sentinelone-nix in either direction.";
+        }
+        {
+          assertion =
+            !cfg.vendorManagedUpdates
+            || (
+              cfg.dataDir != "/nix/var/nix/gcroots/sentinelone-nix"
+              && !hasPrefix "/nix/var/nix/gcroots/sentinelone-nix/" cfg.dataDir
+              && !hasPrefix "${cfg.dataDir}/" "/nix/var/nix/gcroots/sentinelone-nix"
+            );
+          message = "Native SentinelOne dataDir must not overlap /nix/var/nix/gcroots/sentinelone-nix in either direction.";
+        }
+      ];
+    })
+    (mkIf (cfg.enable && cfg.vendorManagedUpdates) (
+      import ./native-module.nix { inherit lib pkgs config; }
+    ))
+    (mkIf (cfg.enable && !cfg.vendorManagedUpdates) {
+      warnings =
+        optional (cfg.email != null) "services.sentinelone.email is deprecated in favour of customerId."
+        ++ optional (
+          cfg.serialNumber != null
+        ) "services.sentinelone.serialNumber is deprecated in favour of customerId.";
 
-    assertions = [
-      {
-        assertion = (cfg.customerId != null) -> (cfg.email == null && cfg.serialNumber == null);
-        message = ''
-          You cannot use services.sentinelone.customerId with the deprecated services.sentinelone.email and services.sentinelone.serialNumber options.
-        '';
-      }
-      {
-        assertion = (cfg.email != null) -> (cfg.serialNumber != null);
-        message = ''
-          services.sentinelone.email requires services.sentinelone.serialNumber to also be set.
-        '';
-      }
-      {
-        assertion = (cfg.serialNumber != null) -> (cfg.email != null);
-        message = ''
-          services.sentinelone.serialNumber requires services.sentinelone.email to also be set.
-        '';
-      }
-    ];
+      assertions = [
+        {
+          assertion = (cfg.customerId != null) -> (cfg.email == null && cfg.serialNumber == null);
+          message = ''
+            You cannot use services.sentinelone.customerId with the deprecated services.sentinelone.email and services.sentinelone.serialNumber options.
+          '';
+        }
+        {
+          assertion = (cfg.email != null) -> (cfg.serialNumber != null);
+          message = ''
+            services.sentinelone.email requires services.sentinelone.serialNumber to also be set.
+          '';
+        }
+        {
+          assertion = (cfg.serialNumber != null) -> (cfg.email != null);
+          message = ''
+            services.sentinelone.serialNumber requires services.sentinelone.email to also be set.
+          '';
+        }
+      ];
 
-    users.users.sentinelone = {
-      isSystemUser = true;
-      createHome = true;
-      shell = "${pkgs.shadow}/bin/nologin";
-      group = "sentinelone";
-    };
-    users.groups.sentinelone = { };
-
-    # Do not let tmpfiles create/chown unvalidated legacy state.
-    systemd.services.sentinelone-init = {
-      before = [ "sentinelone.service" ];
-      unitConfig.RequiresMountsFor = [ cfg.dataDir ];
-      serviceConfig = {
-        Type = "oneshot";
-        User = "root";
-        Group = "root";
-        UMask = "0077";
-        ExecStart = "${getExe pkgs.python3} ${./bootstrap.py} ${initConfig}";
+      users.users.sentinelone = {
+        isSystemUser = true;
+        createHome = true;
+        shell = "${pkgs.shadow}/bin/nologin";
+        group = "sentinelone";
       };
-    };
+      users.groups.sentinelone = { };
 
-    environment.systemPackages = [
-      cfg.package
-      sentinelctlScript
-    ];
+      # Do not let tmpfiles create/chown unvalidated legacy state.
+      systemd.services.sentinelone-init = {
+        before = [ "sentinelone.service" ];
+        unitConfig.RequiresMountsFor = [ cfg.dataDir ];
+        serviceConfig = {
+          Type = "oneshot";
+          User = "root";
+          Group = "root";
+          UMask = "0077";
+          ExecStart = "${getExe pkgs.python3} ${./bootstrap.py} ${initConfig}";
+        };
+      };
 
-    systemd.mounts = [
-      {
-        what = cfg.dataDir;
-        where = "/opt/sentinelone";
-        type = "none";
-        # Keep component mounts from propagating back into the persistent source.
-        options = "bind,rprivate";
+      environment.systemPackages = [
+        cfg.package
+        sentinelctlScript
+      ];
+
+      systemd.mounts = [
+        {
+          what = cfg.dataDir;
+          where = "/opt/sentinelone";
+          type = "none";
+          # Keep component mounts from propagating back into the persistent source.
+          options = "bind,rprivate";
+          requires = [ "sentinelone-init.service" ];
+          after = [ "sentinelone-init.service" ];
+          # This late, service-owned mount must not precede local-fs.target:
+          # its initializer waits for normal boot and runtime secret provisioning.
+          unitConfig = {
+            DefaultDependencies = "no";
+            Conflicts = "umount.target";
+            Before = "umount.target";
+            RequiresMountsFor = [
+              cfg.dataDir
+              "/opt"
+            ];
+          };
+        }
+      ]
+      ++ map mkBindMount mountPaths;
+
+      systemd.services.sentinelone = {
+        enable = true;
+        description = "SentinelOne";
         requires = [ "sentinelone-init.service" ];
         after = [ "sentinelone-init.service" ];
-        # This late, service-owned mount must not precede local-fs.target:
-        # its initializer waits for normal boot and runtime secret provisioning.
-        unitConfig = {
-          DefaultDependencies = "no";
-          Conflicts = "umount.target";
-          Before = "umount.target";
-          RequiresMountsFor = [
-            cfg.dataDir
-            "/opt"
-          ];
-        };
-      }
-    ]
-    ++ map mkBindMount mountPaths;
-
-    systemd.services.sentinelone = {
-      enable = true;
-      description = "SentinelOne";
-      requires = [ "sentinelone-init.service" ];
-      after = [ "sentinelone-init.service" ];
-      path = [
-        pkgs.coreutils-full
-        pkgs.gawk
-        pkgs.zlib
-        pkgs.libelf
-        pkgs.bash
-      ];
-      unitConfig = {
-        Description = "SentinelOne";
-        After = [
-          "uptrack-prefetch.service"
-          "uptrack.service"
+        path = [
+          pkgs.coreutils-full
+          pkgs.gawk
+          pkgs.zlib
+          pkgs.libelf
+          pkgs.bash
         ];
-        RefuseManualStop = "yes";
-        StartLimitInterval = "90";
-        StartLimitBurst = "4";
-        RequiresMountsFor = map (path: "/opt/sentinelone/${path}") mountPaths;
+        unitConfig = {
+          Description = "SentinelOne";
+          After = [
+            "uptrack-prefetch.service"
+            "uptrack.service"
+          ];
+          RefuseManualStop = "yes";
+          StartLimitInterval = "90";
+          StartLimitBurst = "4";
+          RequiresMountsFor = map (path: "/opt/sentinelone/${path}") mountPaths;
+        };
+        serviceConfig = {
+          Type = "exec";
+          ExecStart = "${cfg.package}/opt/sentinelone/bin/sentinelone-agent";
+          WorkingDirectory = "/opt/sentinelone/bin";
+          WatchdogSec = "30s";
+          Restart = "on-failure";
+          RestartSec = "4";
+          ExecStop = "${lib.getExe sentinelctlFhs} control stop";
+          MemoryAccounting = "yes";
+          NotifyAccess = "all";
+          TasksMax = "infinity";
+        };
+        wantedBy = [ "multi-user.target" ];
       };
-      serviceConfig = {
-        Type = "exec";
-        ExecStart = "${cfg.package}/opt/sentinelone/bin/sentinelone-agent";
-        WorkingDirectory = "/opt/sentinelone/bin";
-        WatchdogSec = "30s";
-        Restart = "on-failure";
-        RestartSec = "4";
-        ExecStop = "${lib.getExe sentinelctlFhs} control stop";
-        MemoryAccounting = "yes";
-        NotifyAccess = "all";
-        TasksMax = "infinity";
-      };
-      wantedBy = [ "multi-user.target" ];
-    };
-  };
+    })
+  ];
 }
