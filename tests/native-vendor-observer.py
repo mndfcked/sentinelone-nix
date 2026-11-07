@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -252,6 +253,19 @@ def mount_smoke():
     return {"checks": checks}
 
 
+def validate_mapping(parent, mapping, target, vendor_uid):
+    """Validate physical /opt metadata and the exact vendor payload mapping."""
+    assert (
+        stat.S_ISDIR(parent.st_mode)
+        and parent.st_uid == 0
+        and not parent.st_mode & 0o022
+    ), "Unsafe /opt parent"
+    assert stat.S_ISLNK(mapping.st_mode) and mapping.st_uid in (0, vendor_uid), (
+        "Unsafe /opt/sentinelone mapping"
+    )
+    assert target == ROOT, "Wrong /opt/sentinelone target"
+
+
 def snapshot():
     # Mount exclusions precede any payload open; never walk mounted BPF trees.
     mountinfo = read(f"/proc/{os.getpid()}/mountinfo", 262144).decode()
@@ -266,10 +280,12 @@ def snapshot():
             path, include_inode=True, limit=128 * 1024 * 1024
         )
     assert stat.S_ISDIR(physical_info(ROOT).st_mode)
-    assert stat.S_ISDIR(physical_info("/opt").st_mode)
-    mapping = os.lstat("/opt/sentinelone")
-    assert mapping.st_uid == 0 and stat.S_ISLNK(mapping.st_mode)
-    assert os.readlink("/opt/sentinelone") == ROOT
+    validate_mapping(
+        physical_info("/opt"),
+        os.lstat("/opt/sentinelone"),
+        os.readlink("/opt/sentinelone"),
+        pwd.getpwnam("sentinelone").pw_uid,
+    )
     for path in (
         "/etc/systemd/system/sentinelone.service",
         "/etc/systemd/system/multi-user.target.wants/sentinelone.service",

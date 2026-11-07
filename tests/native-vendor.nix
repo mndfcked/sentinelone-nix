@@ -47,6 +47,7 @@ pkgs.testers.runNixOSTest {
       environment.etc."sentinelone-test-generation".text = lib.mkForce "next\n";
     };
     system.switch.enable = true;
+    nix.settings.build-users-group = lib.mkForce "";
 
     # The real controller requires multi-user.target not yet active. Hold that
     # target while the backdoor runs; never replace the module's boot marker.
@@ -242,6 +243,11 @@ pkgs.testers.runNixOSTest {
             )
             p = dict(line.split("=", 1) for line in output.splitlines())
             samples.append(p)
+            report["windows"][label] = {
+                "samples": samples,
+                "elapsed": time.monotonic() - started,
+            }
+            save()
             assert all(
                 p[key] == value
                 for key, value in {
@@ -260,10 +266,7 @@ pkgs.testers.runNixOSTest {
         assert len({p["MainPID"] for p in samples}) == 1
         ticks = [int(p["WatchdogTimestampMonotonic"]) for p in samples]
         assert all(a <= b for a, b in zip(ticks, ticks[1:])) and ticks[-1] > ticks[0]
-        report["windows"][label] = {
-            "samples": samples,
-            "elapsed": time.monotonic() - started,
-        }
+        report["windows"][label]["elapsed"] = time.monotonic() - started
         save()
 
 
@@ -463,6 +466,75 @@ pkgs.testers.runNixOSTest {
         report["failures"].append(
             {"type": type(error).__name__, "stage": report.get("stage", "starting")}
         )
+        window = report["windows"].get(report["stage"].removesuffix("-stable-window"))
+        if window and window["samples"]:
+            print("VENDOR_STABILITY_DIAGNOSTIC=" + json.dumps({
+                "stage": report["stage"], "count": len(window["samples"]),
+                "first": window["samples"][0], "last": window["samples"][-1],
+            }, sort_keys=True))
+        try:
+            status = machine.succeed(
+                "systemctl show sentinelone.service --property="
+                "ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus"
+            )
+            report["unit_failure_diagnostic"] = dict(
+                line.split("=", 1) for line in status.splitlines()
+            )
+            print("VENDOR_UNIT_DIAGNOSTIC=" + json.dumps(report["unit_failure_diagnostic"], sort_keys=True))
+        except Exception as status_error:
+            print("VENDOR_UNIT_DIAGNOSTIC=" + type(status_error).__name__)
+        try:
+            diagnostic_code = """
+    import json
+    import os
+    import pwd
+    import stat
+
+    result = {"paths": {}}
+    for path in [
+        "/opt",
+        "/opt/sentinelone",
+        "/var/lib/sentinelone-vendor-payload",
+        "/var/lib/sentinelone-vendor-payload/configuration",
+        "/var/lib/sentinelone-vendor-payload/configuration/sentinelone.service",
+    ]:
+        try:
+            meta = os.lstat(path)
+            entry = {
+                "exists": True,
+                "type": stat.filemode(meta.st_mode)[0],
+                "uid": meta.st_uid,
+                "gid": meta.st_gid,
+                "mode": oct(stat.S_IMODE(meta.st_mode)),
+            }
+            if stat.S_ISLNK(meta.st_mode):
+                entry["readlink"] = os.readlink(path)[:2048]
+            result["paths"][path] = entry
+        except FileNotFoundError:
+            result["paths"][path] = {"exists": False}
+        except OSError as path_error:
+            result["paths"][path] = {"error": type(path_error).__name__}
+    try:
+        account = pwd.getpwnam("sentinelone")
+        result["sentinelone"] = {"uid": account.pw_uid, "gid": account.pw_gid}
+    except KeyError:
+        result["sentinelone"] = {"exists": False}
+    print(json.dumps(result, sort_keys=True))
+    """
+            diagnostic_status, diagnostic_output = machine.execute(
+                shlex.join([PYTHON, "-c", diagnostic_code]),
+                timeout=dt.timedelta(seconds=10),
+            )
+            if diagnostic_status != 0:
+                raise RuntimeError("guest collector exit " + str(diagnostic_status))
+            diagnostic = json.loads(diagnostic_output)
+            diagnostic_json = json.dumps(diagnostic, sort_keys=True)
+            if len(diagnostic_json.encode()) > 16384:
+                raise ValueError("guest collector exceeded 16 KiB")
+            report["vendor_mapping_diagnostic"] = diagnostic
+        except Exception as collector_error:
+            diagnostic_json = json.dumps({"collector_error": type(collector_error).__name__})
+        print("VENDOR_MAPPING_DIAGNOSTIC=" + diagnostic_json)
         save()
         raise
   '';

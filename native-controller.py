@@ -10,11 +10,12 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+import pwd
 import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 CONTROL = Path("/var/lib/sentinelone-nix")
 STATE = CONTROL / "state.json"
@@ -79,19 +80,24 @@ def directory(path, private=False):
         require(stat.S_IMODE(info.st_mode) == 0o700, "directory must be 0700: " + str(path))
 
 
-def read_regular(path, limit=65536, private=False, check_parents=True):
+def read_regular(path, limit=65536, private=False, check_parents=True, dir_fd=None, device=None):
     if check_parents:
         ancestors(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     try:
         info = os.fstat(fd)
         require(stat.S_ISREG(info.st_mode) and info.st_uid == 0
                 and not info.st_mode & 0o022 and info.st_size <= limit,
                 "unsafe regular file: " + str(path))
+        require(device is None or info.st_dev == device, "unit crosses payload filesystem")
         if private:
             require(stat.S_IMODE(info.st_mode) == 0o600, "file must be 0600: " + str(path))
         content = os.read(fd, limit + 1)
-        require(len(content) == info.st_size, "file changed during read: " + str(path))
+        after = os.fstat(fd)
+        require(len(content) == info.st_size
+                and all(getattr(info, field) == getattr(after, field) for field in
+                        ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size",
+                         "st_mtime_ns", "st_ctime_ns")), "file changed during read: " + str(path))
         return content
     finally:
         os.close(fd)
@@ -412,23 +418,55 @@ def installed(config, package):
     require(status == "install ok installed", "package not configured: " + package)
 
 
+def protected_hardlinks_check():
+    path = Path("/proc/sys/fs/protected_hardlinks")
+    ancestors(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0
+                and not info.st_mode & 0o022, "unsafe protected_hardlinks sysctl")
+        value = os.read(fd, 16)
+        require(len(value) < 16 and value.strip() == b"1", "protected_hardlinks must be 1")
+    finally:
+        os.close(fd)
+
+
 def payload_check(config):
+    try:
+        vendor_uid = pwd.getpwnam("sentinelone").pw_uid
+    except KeyError as error:
+        raise Refusal("missing local sentinelone account") from error
+    protected_hardlinks_check()
     data = Path(config["data_dir"])
     ancestors(data)
-    info = data.lstat()
-    require(stat.S_ISDIR(info.st_mode), "payload is not a physical directory")
     directory(OPT.parent)
-    require(OPT.is_symlink() and OPT.lstat().st_uid == 0
+    link = OPT.lstat()
+    require(stat.S_ISLNK(link.st_mode) and link.st_uid in (0, vendor_uid)
             and os.readlink(OPT) == str(data), "unexpected vendor /opt mapping")
     persistent_unit_check()
-    # Vendor owns the payload; do not require root ownership recursively or follow
-    # live BPF mounts. Only the current unit's structural path is protected.
-    unit_parent = data / "configuration"
-    info = unit_parent.lstat()
-    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
-            and not info.st_mode & 0o022, "unsafe vendor unit directory")
-    source = unit_parent / "sentinelone.service"
-    content = read_regular(source, check_parents=False)
+    # Pin only the structural path, never traverse payload contents or BPF mounts.
+    # Root manages the namespace; the vendor UID may own these directories/link,
+    # but the current unit must still be root-owned and protected from writes.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    data_fd = os.open(data, flags)
+    try:
+        info = os.fstat(data_fd)
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid in (0, vendor_uid)
+                and not info.st_mode & 0o022, "unsafe payload directory")
+        device = info.st_dev
+        config_fd = os.open("configuration", flags, dir_fd=data_fd)
+        try:
+            info = os.fstat(config_fd)
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid in (0, vendor_uid)
+                    and not info.st_mode & 0o022, "unsafe vendor unit directory")
+            require(info.st_dev == device, "configuration crosses payload filesystem")
+            content = read_regular(Path("sentinelone.service"), check_parents=False,
+                                   dir_fd=config_fd, device=device)
+        finally:
+            os.close(config_fd)
+    finally:
+        os.close(data_fd)
     owned = run([config["dpkg_query"], "-S",
                  "/opt/sentinelone/configuration/sentinelone.service"], config).strip()
     require(owned in (

@@ -8,11 +8,12 @@ import contextlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+import pwd
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 SOURCE = Path(sys.argv.pop(1)) if len(sys.argv) > 1 else Path(__file__).parents[1] / "native-controller.py"
@@ -44,6 +45,10 @@ class Fixture:
         self.fault = fault
         self.hit = False
         self.events = []
+        self.owners = {}
+        self.vendor_uid = 998
+        self.stack.enter_context(patch.object(pwd, "getpwnam", return_value=pwd.struct_passwd(
+            ("sentinelone", "x", self.vendor_uid, 997, "", "/opt/sentinelone/home", "/bin/false"))))
         self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.control = self.base / "control"
         self.roots = self.base / "roots"
@@ -79,9 +84,11 @@ class Fixture:
         self.stack.enter_context(patch.object(controller, "ancestors", lambda path: None))
         def root_owned(original):
             def observe(*args, **kwargs):
-                fields = list(original(*args, **kwargs))
-                fields[4:6] = [0, 0]
-                return os.stat_result(fields)
+                info = original(*args, **kwargs)
+                fields = list(info)
+                fields[4:6] = [self.owners.get(info.st_ino, 0), 0]
+                return os.stat_result(fields, {name: getattr(info, name) for name in
+                                             ("st_atime_ns", "st_mtime_ns", "st_ctime_ns")})
             return observe
 
         for name in ("stat", "lstat", "fstat"):
@@ -94,6 +101,16 @@ class Fixture:
             return original_read(path, *args, **kwargs)
 
         self.stack.enter_context(patch.object(controller, "read_regular", read))
+        self.hardlinks = self.base / "protected-hardlinks"
+        self.hardlinks.write_bytes(b"1\n")
+        original_os_open = os.open
+
+        def os_open(path, *args, **kwargs):
+            if str(path) == "/proc/sys/fs/protected_hardlinks":
+                path = self.hardlinks
+            return original_os_open(path, *args, **kwargs)
+
+        self.stack.enter_context(patch.object(os, "open", os_open))
         seed_file = self.base / "seed.deb"
         seed_file.write_bytes(b"synthetic metadata input")
         original_open = open
@@ -262,6 +279,176 @@ class Fixture:
         return {str(p.relative_to(self.base)):
                 (p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None)
                 for p in self.base.rglob("*")}
+
+
+class PayloadTests(unittest.TestCase):
+    def fixture(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        return fixture
+
+    def test_root_owned_structure_remains_valid(self):
+        fixture = self.fixture()
+        self.assertEqual(b"[Service]\n", controller.payload_check(fixture.config))
+
+    def test_vendor_owned_opt_link_is_valid_without_reownership(self):
+        fixture = self.fixture()
+        link = fixture.paths["OPT"]
+        fixture.owners[link.lstat().st_ino] = fixture.vendor_uid
+        before = link.lstat()
+        self.assertEqual(b"[Service]\n", controller.payload_check(fixture.config))
+        after = link.lstat()
+        self.assertEqual((before.st_uid, before.st_mode, before.st_ctime_ns),
+                         (after.st_uid, after.st_mode, after.st_ctime_ns))
+
+    def test_vendor_owned_sticky_configuration_is_valid(self):
+        fixture = self.fixture()
+        parent = fixture.data / "configuration"
+        fixture.owners[parent.stat().st_ino] = fixture.vendor_uid
+        parent.chmod(0o1700)
+        fixture.owners[fixture.data.stat().st_ino] = fixture.vendor_uid
+        self.assertEqual(b"[Service]\n", controller.payload_check(fixture.config))
+
+    def test_unsafe_payload_structure_is_refused(self):
+        cases = [
+            ("opt", "owner"), ("opt", "target"), ("opt-parent", "mode"),
+            ("data", "owner"), ("data", "group-write"), ("data", "other-write"),
+            ("data", "symlink"),
+            ("configuration", "owner"), ("configuration", "group-write"),
+            ("configuration", "other-write"), ("configuration", "symlink"),
+            ("unit", "owner"), ("unit", "vendor-owner"), ("unit", "group-write"),
+            ("unit", "other-write"), ("unit", "symlink"), ("unit", "oversized"),
+            ("unit", "fifo"),
+        ]
+        for entry, kind in cases:
+            with self.subTest(entry=entry, kind=kind):
+                fixture = Fixture()
+                try:
+                    parent = fixture.data / "configuration"
+                    unit = parent / "sentinelone.service"
+                    path = {"opt": fixture.paths["OPT"], "opt-parent": fixture.paths["OPT"].parent,
+                            "data": fixture.data, "configuration": parent, "unit": unit}[entry]
+                    if kind in ("owner", "vendor-owner"):
+                        fixture.owners[path.lstat().st_ino] = (fixture.vendor_uid if kind == "vendor-owner"
+                                                              else fixture.vendor_uid + 1)
+                    elif kind == "target":
+                        path.unlink()
+                        path.symlink_to(str(fixture.data) + "/")
+                    elif kind == "symlink":
+                        moved = path.with_name(path.name + "-moved")
+                        path.rename(moved)
+                        path.symlink_to(moved)
+                    elif kind == "oversized":
+                        path.write_bytes(b"x" * 65537)
+                    elif kind == "fifo":
+                        path.unlink()
+                        os.mkfifo(path)
+                    else:
+                        path.chmod(path.stat().st_mode | (0o020 if kind == "group-write" else 0o002))
+                    before = fixture.snapshot() if kind != "fifo" else None
+                    with self.assertRaises((controller.Refusal, OSError)):
+                        controller.payload_check(fixture.config)
+                    if before is not None:
+                        self.assertEqual(before, fixture.snapshot())
+                finally:
+                    fixture.close()
+
+    def test_local_vendor_account_is_required(self):
+        fixture = self.fixture()
+        with (
+            patch.object(pwd, "getpwnam", side_effect=KeyError("sentinelone")),
+            self.assertRaises(controller.Refusal),
+        ):
+            controller.payload_check(fixture.config)
+
+    def test_protected_hardlinks_is_required(self):
+        fixture = self.fixture()
+        for value in (b"0\n", b"2\n", b"", b"1 extra\n", b"1" + b" " * 32):
+            with self.subTest(value=value):
+                fixture.hardlinks.write_bytes(value)
+                with self.assertRaises(controller.Refusal):
+                    controller.payload_check(fixture.config)
+
+    def test_only_subordinate_structural_filesystem_crossings_are_refused(self):
+        fixture = self.fixture()
+        paths = [fixture.data, fixture.data / "configuration",
+                 fixture.data / "configuration/sentinelone.service"]
+        inodes = [path.stat().st_ino for path in paths]
+        original_fstat = os.fstat
+        for crossing in ("configuration", "unit", "whole-data-mount"):
+            with self.subTest(crossing=crossing):
+                changed = set(inodes if crossing == "whole-data-mount" else
+                              [inodes[1 if crossing == "configuration" else 2]])
+
+                def fstat(fd, changed=changed):
+                    info = original_fstat(fd)
+                    if info.st_ino not in changed:
+                        return info
+                    fields = list(info)
+                    fields[2] += 1
+                    return os.stat_result(fields, {name: getattr(info, name) for name in
+                                                 ("st_atime_ns", "st_mtime_ns", "st_ctime_ns")})
+
+                with patch.object(os, "fstat", fstat):
+                    if crossing == "whole-data-mount":
+                        self.assertEqual(b"[Service]\n", controller.payload_check(fixture.config))
+                    else:
+                        with self.assertRaises(controller.Refusal):
+                            controller.payload_check(fixture.config)
+
+    def test_replaced_parent_cannot_redirect_read_to_another_root_owned_unit(self):
+        fixture = self.fixture()
+        parent = fixture.data / "configuration"
+        replacement = fixture.base / "unrelated-root-unit"
+        replacement.mkdir()
+        (replacement / "sentinelone.service").write_bytes(b"[Service]\nExecStart=/malicious\n")
+        original_open = os.open
+        descriptors = []
+        swapped = False
+
+        def os_open(path, *args, **kwargs):
+            nonlocal swapped
+            if Path(path).name == "sentinelone.service":
+                parent.rename(fixture.data / "pinned-configuration")
+                parent.symlink_to(replacement)
+                swapped = True
+            fd = original_open(path, *args, **kwargs)
+            descriptors.append(fd)
+            return fd
+
+        with patch.object(os, "open", os_open):
+            content = controller.payload_check(fixture.config)
+        self.assertTrue(swapped, "replacement race never reached")
+        self.assertEqual(b"[Service]\n", content)
+        for fd in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_concurrent_same_size_unit_mutation_is_refused(self):
+        fixture = self.fixture()
+        unit = fixture.data / "configuration/sentinelone.service"
+        info = unit.stat()
+        original_read = os.read
+        mutated = False
+
+        def read(fd, size):
+            nonlocal mutated
+            content = original_read(fd, size)
+            if os.fstat(fd).st_ino == info.st_ino:
+                unit.write_bytes(b"[Socket] \n")
+                os.utime(unit, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                mutated = True
+            return content
+
+        with patch.object(os, "read", read), self.assertRaises(controller.Refusal):
+            controller.payload_check(fixture.config)
+        self.assertTrue(mutated, "read mutation never reached")
+
+    def test_unit_size_bound_includes_65536_bytes(self):
+        fixture = self.fixture()
+        content = b"x" * 65536
+        (fixture.data / "configuration/sentinelone.service").write_bytes(content)
+        self.assertEqual(content, controller.payload_check(fixture.config))
 
 
 class Transactions(unittest.TestCase):

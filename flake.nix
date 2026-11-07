@@ -90,6 +90,55 @@
               '';
               native-observer = pkgs.runCommand "native-observer" { } ''
                 ${pkgs.python3}/bin/python3 -B ${./tests/native-vendor-observer.py} mount-smoke > $out
+                ${pkgs.python3}/bin/python3 -B - ${./tests/native-vendor-observer.py} <<'PY'
+                import os
+                import runpy
+                import stat
+                import sys
+
+                observer = runpy.run_path(sys.argv[1])
+                validate = observer["validate_mapping"]
+                target = "/var/lib/sentinelone-vendor-payload"
+                vendor_uid = 1234
+
+
+                def metadata(kind, mode, uid):
+                    return os.stat_result((kind | mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+
+                parent = metadata(stat.S_IFDIR, 0o755, 0)
+                root_link = metadata(stat.S_IFLNK, 0o777, 0)
+                vendor_link = metadata(stat.S_IFLNK, 0o777, vendor_uid)
+                validate(parent, root_link, target, vendor_uid)
+                print("mapping: root-owned link accepted", flush=True)
+                validate(parent, vendor_link, target, vendor_uid)
+                print("mapping: vendor-owned link accepted", flush=True)
+
+                for label, directory, mapping, link_target in (
+                    ("foreign owner", parent, metadata(stat.S_IFLNK, 0o777, 2345), target),
+                    ("wrong target", parent, vendor_link, target + "-other"),
+                    (
+                        "relative target",
+                        parent,
+                        vendor_link,
+                        "../../var/lib/sentinelone-vendor-payload",
+                    ),
+                    ("directory mapping", parent, metadata(stat.S_IFDIR, 0o755, vendor_uid), target),
+                    ("regular mapping", parent, metadata(stat.S_IFREG, 0o644, 0), target),
+                    ("nonroot parent", metadata(stat.S_IFDIR, 0o755, vendor_uid), root_link, target),
+                    ("group-writable parent", metadata(stat.S_IFDIR, 0o775, 0), root_link, target),
+                    ("other-writable parent", metadata(stat.S_IFDIR, 0o757, 0), root_link, target),
+                    ("symlink parent", metadata(stat.S_IFLNK, 0o777, 0), root_link, target),
+                    ("regular parent", metadata(stat.S_IFREG, 0o644, 0), root_link, target),
+                ):
+                    try:
+                        validate(directory, mapping, link_target, vendor_uid)
+                    except AssertionError as error:
+                        assert str(error), label + ": missing diagnostic"
+                    else:
+                        raise AssertionError(label + " accepted")
+                    print("mapping: " + label + " rejected")
+                PY
               '';
             };
           }

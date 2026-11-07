@@ -94,7 +94,7 @@ in
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      UMask = "0077";
+      UMask = "0022";
       TimeoutStartSec = "180s";
       ExecStart = "${controller} reconcile ${bootConfig}";
     };

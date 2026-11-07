@@ -28,6 +28,7 @@ let
         test "$S1_AGENT_CREATE_USER" = false
         if test "${version}" = 1; then
           test "$HOME" = /root
+          umask > /run/native-dpkg-umask
           # Genuine Nix discovery, not merely the existence of symlinks.
           for name in pending transaction; do
             root=/nix/var/nix/gcroots/sentinelone-nix/$name
@@ -40,6 +41,7 @@ let
           mkdir -p "$S1_AGENT_CUSTOM_INSTALL_PATH"
           ln -s "$S1_AGENT_CUSTOM_INSTALL_PATH" /opt/sentinelone
         fi
+        chown -h sentinelone:sentinelone /opt/sentinelone
         EOF
         cat > package/DEBIAN/postinst <<'EOF'
         #!/bin/sh
@@ -54,7 +56,8 @@ let
             sleep 1
           done
         fi
-        chown sentinelone:sentinelone "$S1_AGENT_CUSTOM_INSTALL_PATH"
+        chown sentinelone:sentinelone "$S1_AGENT_CUSTOM_INSTALL_PATH" "$S1_AGENT_CUSTOM_INSTALL_PATH/configuration"
+        chmod 1700 "$S1_AGENT_CUSTOM_INSTALL_PATH/configuration"
         install -m 644 /opt/sentinelone/configuration/sentinelone.service /usr/lib/systemd/system/sentinelone.service
         systemctl enable sentinelone.service
         EOF
@@ -116,6 +119,12 @@ let
       pkgs.dpkg
     ];
     system.switch.enable = true;
+    systemd.services.sentinelone-init.preStart = ''
+      # Observe only: these slots must be created by the controller, not repaired.
+      for path in /opt /usr/sbin /usr/lib /usr/lib/systemd; do
+        if ! test -e "$path"; then printf '%s\n' "$path"; fi
+      done > /run/native-new-public-directories
+    '';
     specialisation = {
       next.configuration = {
         environment.etc."native-generation".text = "next";
@@ -179,6 +188,48 @@ pkgs.testers.runNixOSTest {
     def guest(code, node=machine):
         return node.succeed("python3 -c " + shlex.quote(code))
 
+    def payload_layout():
+        print(guest("""
+    import os,pwd,stat
+    from pathlib import Path
+    uid = pwd.getpwnam('sentinelone').pw_uid
+    data = Path('/var/lib/native-payload')
+    opt = Path('/opt/sentinelone')
+    assert opt.is_symlink() and opt.lstat().st_uid == uid
+    assert os.readlink(opt) == str(data)
+    for path, mode in [(data, 0o755), (data / 'configuration', 0o1700)]:
+        info = path.lstat()
+        assert stat.S_ISDIR(info.st_mode) and info.st_uid == uid
+        assert stat.S_IMODE(info.st_mode) == mode
+    unit = data / 'configuration/sentinelone.service'
+    assert stat.S_IMODE(unit.lstat().st_mode) == 0o644
+    for path in [unit, Path('/run/systemd/system/sentinelone.service')]:
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == 0
+        assert not info.st_mode & 0o022
+    assert stat.S_IMODE(Path('/run/systemd/system/sentinelone.service').lstat().st_mode) in (0o600, 0o644)
+    assert unit.read_bytes() == Path('/run/systemd/system/sentinelone.service').read_bytes()
+    private = {}
+    for mode, paths in [
+        (0o700, ['/var/lib/sentinelone-nix', '/var/lib/sentinelone-nix/dpkg',
+                  '/nix/var/nix/gcroots/sentinelone-nix',
+                  '/run/systemd/system/sentinelone.service.d']),
+        (0o600, ['/var/lib/sentinelone-nix/state.json',
+                  '/var/lib/sentinelone-nix/controller.lock',
+                  '/var/lib/sentinelone-nix/dpkg/lock',
+                  '/var/lib/sentinelone-nix/dpkg/lock-frontend',
+                  '/run/sentinelone-nix-boot-config', '/run/sentinelone-nix-reconciled',
+                  '/run/systemd/system/sentinelone.service.d/50-native-runtime.conf']),
+    ]:
+        for raw in paths:
+            info = Path(raw).lstat()
+            assert (stat.S_ISDIR(info.st_mode) if mode == 0o700 else stat.S_ISREG(info.st_mode)), raw
+            assert info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == mode, raw
+            private[raw] = [oct(mode), info.st_uid, info.st_gid]
+    print('Private control metadata:', private)
+    assert Path('/proc/sys/fs/protected_hardlinks').read_text().strip() == '1'
+    """))
+
     def state():
         return json.loads(machine.succeed("cat " + state_path))
 
@@ -220,11 +271,47 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("sentinelone-init.service")
     machine.wait_for_unit("sentinelone.service")
     machine.wait_until_succeeds("test -s " + root + "/data/starts")
+    payload_layout()
     initial = state()
     assert initial["phase"] == "ready" and initial["seed"]["version"] == "1"
     assert initial["mode"] == "vendor-managed"
     conf = config_path()
     assert initial["runtime_active"] == conf
+    public = json.loads(guest("conf = " + repr(conf) + """
+    import json,os,pwd,stat
+    from pathlib import Path
+    config = json.loads(Path(conf).read_text())
+    manifest = json.loads(Path(config['runtime_manifest']).read_text())
+    paths = Path('/run/native-new-public-directories').read_text().splitlines()
+    assert '/opt' in paths and set(paths) - {'/opt'}
+    assert set(paths) <= {'/opt', *manifest['required_directories']}
+    metadata = {}
+    for path in paths:
+        info = Path(path).lstat()
+        assert stat.S_ISDIR(info.st_mode)
+        metadata[path] = [oct(stat.S_IMODE(info.st_mode)), info.st_uid, info.st_gid]
+    print(json.dumps(metadata))
+    """))
+    print("New controller-created public directory metadata:", public)
+    assert all(info == ["0o755", 0, 0] for info in public.values()), public
+    print(guest("paths = " + repr(list(public)) + "\nconf = " + repr(conf) + """
+    import json,os,pwd
+    from pathlib import Path
+    manifest = json.loads(Path(json.loads(Path(conf).read_text())['runtime_manifest']).read_text())
+    account = pwd.getpwnam('sentinelone')
+    child = os.fork()
+    if child == 0:
+        os.setgroups([])
+        os.setgid(account.pw_gid)
+        os.setuid(account.pw_uid)
+        os._exit(0 if all(os.access(p, os.X_OK) for p in paths + list(manifest['exports'])) else 1)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, 'sentinelone cannot traverse public exports'
+    print('Public traversal UID/GID:', account.pw_uid, account.pw_gid, 'exports:', len(manifest['exports']))
+    """))
+    child_umask = machine.succeed("cat /run/native-dpkg-umask").strip()
+    assert int(child_umask, 8) == 0o022, child_umask
+    print("Real dpkg maintscript umask:", child_umask)
     assert machine.succeed(ctl + " status " + conf).strip().startswith("{")
     machine.succeed("test $(stat -c %a " + control + ") = 700")
     machine.succeed("test $(stat -c %a " + state_path + ") = 600")
@@ -302,6 +389,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("sentinelone.service")
     machine.succeed("grep -q '99' /run/systemd/system/sentinelone.service")
     machine.succeed("grep -q '^99$' " + root + "/data/version")
+    payload_layout()
     machine.succeed("grep -q persistent " + root + "/data/user-state")
     assert state()["seed"] == initial["seed"]
 
