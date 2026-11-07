@@ -40,6 +40,53 @@ let
     enable = false;
     package = throw "disabled guard realized proprietary source";
   };
+  # Mirrors the documented disabled native example in
+  # docs/linux-package-upgrade-decision.md, including its requireFile call.
+  # Evaluation must succeed without the private DEB being present.
+  documentedExample =
+    (lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        nixosModules.default
+        {
+          system.stateVersion = "25.11";
+          boot.isContainer = true;
+          # requireFile marks its output unfree (undistributable artifact), so
+          # evaluating the documented example's src needs an unfree allowance;
+          # real deployments choose their own predicate.
+          nixpkgs.config.allowUnfree = true;
+          fileSystems."/" = {
+            device = "none";
+            fsType = "tmpfs";
+          };
+        }
+        (
+          { pkgs, ... }:
+          {
+            services.sentinelone = {
+              enable = false;
+              vendorManagedUpdates = true;
+              sentinelOneManagementTokenPath = null;
+              customerId = null;
+              email = null;
+              serialNumber = null;
+              dataDir = "/var/lib/sentinelone";
+              package = pkgs.sentinelone.overrideAttrs (_old: {
+                version = "26.2.1.24";
+                src = pkgs.requireFile {
+                  name = "SentinelAgent_linux_x86_64_v26_2_1_24.deb";
+                  sha256 = "sha256-P/LpflkRNUEKuvuQ6Sl8tVBzjKrfDdQRmyATV0sp5jA=";
+                  # No public artifact URL exists; current nixpkgs requireFile
+                  # still demands a pointer (or custom message) for its
+                  # failure message. Keep in sync with the documented example.
+                  url = "https://www.sentinelone.com/";
+                };
+              });
+            };
+          }
+        )
+      ];
+    }).config;
   # Capability simulation, not historical Nixpkgs release compatibility.
   # This module-system fixture intentionally has no system.preSwitchChecks option.
   withoutHook =
@@ -100,6 +147,8 @@ let
     (valid (native // { dataDir = "/nix/var/nix/gcroots/sentinelone-nix-other"; }))
     (valid (base // { dataDir = "/nix/var/nix/gcroots/sentinelone-nix"; }))
     (builtins.isString disabled.system.preSwitchChecks.sentinelone)
+    (builtins.isString documentedExample.system.preSwitchChecks.sentinelone)
+    (builtins.isString documentedExample.services.sentinelone.package.src.drvPath)
     (!((evaluate native).systemd.services ? sentinelone))
     ((evaluate native).systemd.services.sentinelone-init.restartIfChanged == false)
     ((evaluate native).systemd.services.sentinelone-init.stopIfChanged == false)

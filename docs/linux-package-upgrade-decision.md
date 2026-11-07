@@ -52,6 +52,10 @@ After adding this repository as a pinned flake input named `sentinelone`, use th
       src = pkgs.requireFile {
         name = "SentinelAgent_linux_x86_64_v26_2_1_24.deb";
         sha256 = "sha256-P/LpflkRNUEKuvuQ6Sl8tVBzjKrfDdQRmyATV0sp5jA=";
+        # No public artifact URL exists; the DEB arrives by owner-trusted
+        # administrator handoff. Current nixpkgs requireFile still demands a
+        # pointer (or a custom message) for its failure message.
+        url = "https://www.sentinelone.com/";
       };
     });
   };
@@ -66,7 +70,7 @@ Import the owner-trusted file once into a permitted private local Nix store befo
 nix-store --add-fixed sha256 /path/to/SentinelAgent_linux_x86_64_v26_2_1_24.deb
 ```
 
-Keep that basename: it must match `requireFile.name`. `pkgs.requireFile` does not download the file; the file need not already be present merely to evaluate the expression. Keep the artifact out of this repository and artifact repositories. Do not send it to remote builders, upload daemons, or public caches. A matching hash pins byte identity, not independent vendor authenticity. Later vendor-managed updates do not require handing over each next DEB.
+`pkgs.requireFile` does not download the file; the file need not already be present merely to evaluate the expression. It marks the source with an unfree license (undistributable artifact), so the evaluating configuration needs an unfree allowance, such as `nixpkgs.config.allowUnfreePredicate` matching the package; the one-time local import itself needs none.
 
 ## Native mode contract and limits
 
