@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed native ownership checks for the vendor layout and the initializer's umask: `0022` preserves requested public FHS directory mode `0755` and gives child `dpkg` its normal umask. Vendor-chosen modes and unit policies remain unchanged; controller directories stay `0700` and state files `0600`.
+
+- Recorded focused synthetic and vendor-free sandbox results and the partial actual-DEB module run. Host ENOSPC interrupted that run after bootstrap and one local same-DEB upgrade; full lifecycle proof, the current 35-check public suite, and new remote CI remain pending. Work is paused for handoff.
+
 - Native pre-switch checks now inspect the desired configuration's assembled systemd tree as well as the current persistent tree. Actual switches into declared-unit and package-provided drop-in conflicts are refused before activation. Backward compatibility with legacy configurations is not guaranteed; native metadata names remain reserved.
 
 - Added the experimental `services.sentinelone.vendorManagedUpdates` native mode. It uses the original `package.src` DEB, requires null token and enrollment-ID settings, and performs initialization and provider registration at boot only. Root commands use a fresh root HOME while the vendor unit keeps its own environment. Transaction roots retain configuration references across failures; persistent systemd conflicts and payload overlap with GC roots are refused. See the [decision and evidence](docs/linux-package-upgrade-decision.md) for the contract and verification limits. Real-artifact module proof remains pending, and production automatic updates remain on HOLD. [#2](https://github.com/mndfcked/sentinelone-nix/issues/2) and [#3](https://github.com/mndfcked/sentinelone-nix/issues/3) remain open and are not fulfilled by this work.
