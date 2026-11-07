@@ -69,6 +69,13 @@ pkgs.testers.runNixOSTest {
       mountHostNixStore = lib.mkForce true;
       useNixStoreImage = lib.mkForce false;
       writableStore = lib.mkForce false;
+      # Preserve explicit per-mount protection through bind remounts and reboot.
+      # Keep the generated bind option; the observer rejects any rw store layer.
+      fileSystems."/nix/store".options = lib.mkAfter [
+        "ro"
+        "nosuid"
+        "nodev"
+      ];
       useHostCerts = lib.mkForce false;
       qemu.networkingOptions = lib.mkForce [ "-net none" ];
       forwardPorts = lib.mkForce [ ];

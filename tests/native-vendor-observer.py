@@ -212,6 +212,13 @@ def mount_smoke():
             raise AssertionError(label + " accepted")
 
     rejected(
+        "stacked-rw-store",
+        mountinfo.replace(
+            "/nix/store ro,nosuid,nodev,relatime",
+            "/nix/store rw,nosuid,nodev,relatime",
+        ),
+    )
+    rejected(
         "mixed-ro/rw",
         mountinfo.replace("/nix/store ro,relatime", "/nix/store rw,relatime"),
     )
