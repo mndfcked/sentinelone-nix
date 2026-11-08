@@ -4,11 +4,13 @@
 
 - Fixed native ownership checks for the vendor layout and the initializer's umask: `0022` preserves requested public FHS directory mode `0755` and gives child `dpkg` its normal umask. Vendor-chosen modes and unit policies remain unchanged; controller directories stay `0700` and state files `0600`.
 
-- Recorded focused synthetic and vendor-free sandbox results and the partial actual-DEB module run. Host ENOSPC interrupted that run after bootstrap and one local same-DEB upgrade; full lifecycle proof, the current 35-check public suite, and new remote CI remain pending. Work is paused for handoff.
+- Completed the private actual-DEB module lifecycle with the integration candidate's Nixpkgs, exact Zen kernel, and runtime inputs. One local same-DEB replacement, real `dpkg` execution, nine selected file replacements, five watchdog windows, reboot, and distinct-closure switch/return passed. All nine explicit public checks passed. [Offline validation](docs/native-offline-validation.md) records revisions, reproduction steps, and limits. Authenticated N-to-N+1 remains unproved.
+
+- Kept strict per-layer read-only VM store validation and requested explicit `ro,nosuid,nodev` bind options across reboots. Added a stacked writable-layer rejection fixture and evaluation coverage for the documented `requireFile` example.
 
 - Native pre-switch checks now inspect the desired configuration's assembled systemd tree as well as the current persistent tree. Actual switches into declared-unit and package-provided drop-in conflicts are refused before activation. Backward compatibility with legacy configurations is not guaranteed; native metadata names remain reserved.
 
-- Added the experimental `services.sentinelone.vendorManagedUpdates` native mode. It uses the original `package.src` DEB, requires null token and enrollment-ID settings, and performs initialization and provider registration at boot only. Root commands use a fresh root HOME while the vendor unit keeps its own environment. Transaction roots retain configuration references across failures; persistent systemd conflicts and payload overlap with GC roots are refused. See the [decision and evidence](docs/linux-package-upgrade-decision.md) for the contract and verification limits. Real-artifact module proof remains pending, and production automatic updates remain on HOLD. [#2](https://github.com/mndfcked/sentinelone-nix/issues/2) and [#3](https://github.com/mndfcked/sentinelone-nix/issues/3) remain open and are not fulfilled by this work.
+Production automatic updates remain on HOLD.
 
 - Documented the owner-trusted Linux package candidate, its provenance limits, and a disabled native configuration with a one-time private local import. The legacy package default remains unchanged.
 
@@ -24,6 +26,6 @@
 
 - Breaking: token and data paths must be absolute runtime strings without Nix store context. Readable token sources are refused without permission changes; private secret-manager symlink targets remain supported.
 
-- Fixed the deprecated email/serial-number customer ID fallback and added synthetic VM regressions for bootstrap failure, state preservation, restart, mount dependencies, and customer ID compatibility. Native mode rejects customer-ID enrollment settings. Production automatic updates remain on HOLD, and the current native artifact VM is pending.
+Production automatic updates remain on HOLD.
 
 - Bootstrap initialization waits for the filesystem backing `dataDir`, preventing state writes to an underlay directory before the mount is ready.

@@ -1,8 +1,8 @@
 # Linux package and upgrade decision
 
-Status: work is paused for handoff. Production automatic updates remain on HOLD. Native local-update mode is experimental and unenrolled. The actual-DEB module lifecycle is incomplete; bootstrap and one local same-DEB upgrade passed before host ENOSPC interrupted report saving.
+Status: the credential-free actual-DEB module lifecycle passed offline. Native local-update mode remains experimental and unenrolled. Production automatic updates remain on HOLD.
 
-Date: 2026-11-05
+Date: 2026-11-08
 
 Tracking: [#2](https://github.com/mndfcked/sentinelone-nix/issues/2) and [#3](https://github.com/mndfcked/sentinelone-nix/issues/3) remain open and are not fulfilled by the work recorded here.
 
@@ -70,6 +70,8 @@ Import the owner-trusted file once into a permitted private local Nix store befo
 nix-store --add-fixed sha256 /path/to/SentinelAgent_linux_x86_64_v26_2_1_24.deb
 ```
 
+Keep that basename: it must match `requireFile.name`. Never commit or upload the proprietary artifact, send it to remote builders or upload daemons, or place it in public caches. Unfree metadata does not enforce these transfer restrictions.
+
 `pkgs.requireFile` does not download the file; the file need not already be present merely to evaluate the expression. It marks the source with an unfree license (undistributable artifact), so the evaluating configuration needs an unfree allowance, such as `nixpkgs.config.allowUnfreePredicate` matching the package; the one-time local import itself needs none.
 
 ## Native mode contract and limits
@@ -104,26 +106,10 @@ The checks assume a trusted root-managed filesystem and mount namespace, and a t
 
 ## Evidence and remaining work
 
-An earlier scratch prototype used the actual owner-trusted `26.2.1.24` DEB in a normal installation. It ran `sentinelctl control upgrade --output <same-26.2.1.24-DEB>` and observed a successful real `dpkg` execution. This was a same-package local replacement, not a vendor-confirmed management contract, enrollment, or N-to-N+1 update.
+The current revision-bound results and reproduction procedure live in [native offline validation](native-offline-validation.md). All nine explicit public check attributes passed, with the separate formatting check and scoped Pyright. The actual-module lifecycle passed using the isolated integration candidate's Nixpkgs, exact Zen kernel, loader libraries, Nix, and systemd inputs. It recorded one same-DEB replacement, a real successful dpkg exec witness, nine new physical inodes with unchanged bytes, five 45-second watchdog windows, reboot persistence, and distinct-closure switch/return. No running host was activated.
 
-That prototype observed new inodes with unchanged bytes for all nine selected ELF/library files. The service passed 45-second watchdog windows after the update and after reboot. The test also rebooted and switched between two distinct system closures while retaining the selected agent state. Its observer did not walk the full payload or establish full-tree equality. Default dpkg absence was endpoint evidence only; it did not prove that no transient writes occurred. These prototype results do not establish the current real-artifact module lifecycle.
+Earlier scratch-prototype results are separate from this completed module run. Earlier actual-module failures included host ENOSPC during report saving (cause unknown), an unmeasured capacity margin, missing guest store metadata, and strict rejection of a stacked store bind with VFS rw flags on a read-only superblock. The current run uses measured capacity checks, an empty mode-0555 external metadata stand-in, and explicit read-only VM bind options without weakening per-layer validation. The validation page records those constraints and remaining containment limits.
 
-The new pure test set passed all 19 tests. The latest fresh synthetic run passed in 92.12 seconds with real `dpkg` and a vendor-like layout. It covered 433 exports, vendor-UID traversal, public directories at `0755`, private directories at `0700`, state and environment files at `0600`, dpkg maintainer-script umask `0022`, package version `99`, reboot, distinct OS closures, actual POSIX database locks, and switch conflicts. These tests do not use the proprietary DEB.
+The local-source example is covered at evaluation time without building the proprietary source. The old package default and standalone lock remain unchanged. Exact delivery-head remote CI is recorded in the PR; an earlier green SHA does not cover later changes.
 
-Focused observer checks passed 12 mapping, 12 mount, and 8 reader cases. Nix formatting, scoped lint, Pyright, and type checks passed. Six broader Ruff findings and a formatting difference were present on the unchanged baseline; they are not new green checks.
-
-Earlier full public-suite results and remote CI are for the old published code. The full 35 public checks have not been rerun for the current candidate; new candidate CI is unverified.
-
-A vendor-free probe inside the real Nix build sandbox passed. `register-nix-paths` processed 608 valid paths and one boot-configuration row; the validity check and canonical GC-root check both exited 0, and the root target matched. The initializer did not start and the vendor did not run. All guest store mount layers were effectively read-only. QMP control existed and confirmed an empty network configuration; the guest had no NIC or network routes and only loopback. The guest received only the exact store and private mode-`0700` scratch shares, with no home directory, Downloads, or certificates. An empty-directory mapping through the supported `extra-sandbox-paths` setting stood in for `/nix/store/.links`; it was not the host metadata directory. This external input is not bound into the derivation hash. The builder-side bind remained VFS read-write, but it was empty and mode `0555`, DAC writes were blocked, and the builder UID was non-root. The probe did not manually modify host store metadata or pass the real host `/nix/store/.links` into the guest. Whole-build store visibility and `virtiofsd --sandbox none` with `seccomp none` mean this setup is not hermetic and does not harden against VM escape.
-
-Earlier actual bootstrap attempts exposed incorrect ownership checks and an initializer umask of `0077` that masked requested public directory mode `0755` to `0700`. The current candidate corrects the checks and changes only the initializer umask to `0022`; vendor unit policies and vendor-chosen directory modes remain unchanged.
-
-The latest actual-DEB attempt passed 15 bootstrap samples over 45.0519 seconds with a stable daemon PID, no restarts, a configured 30-second watchdog, and advancing keepalive timestamps. It completed one supported local same-DEB upgrade and trace stop. The new daemon stayed active with no restarts, a configured 30-second watchdog, and advancing keepalive timestamps through 11 post-upgrade samples. Host ENOSPC at `report.save` interrupted the full post-upgrade window; the nine-file after-comparison, reboot, and closure checks were not reached. The full actual-DEB script has never passed. The separate earlier prototype does not supply that proof.
-
-The ENOSPC cause is unknown; other processes also reported ENOSPC at the time. That does not establish which process or condition caused it. Small write-and-fsync checks and normal Nix restoration builds later succeeded. Unrooted pinned Nixpkgs, driver, and formatter paths disappeared for an unknown reason. Restoration used the exact unchanged `flake.lock` Nixpkgs revision `1c89083e451e891152365b799595cf7790a43325` and NAR hash `sha256-Y1CiZ4SoBUjLQyQM/pY+rS2dXD3CHLPstF0lmOc73D4=`. No dependency, version, or lock-file change was made; the restored source, driver, formatter, and original DEB closure were retained with local GC roots.
-
-A later preflight stopped on an ordinary capacity assertion before starting a VM: 18.3 GiB was available against a proposed 20 GiB margin. The proposed 20 GiB and 100,000-inode margins were unmeasured, not product requirements. No new VM or source edit followed that failure. The operator then stopped further validation and requested a pushed WIP handoff. There is no retry running, and no full lifecycle pass is claimed.
-
-The lifecycle run aims to observe isolated `dpkg` execution, new inodes with unchanged bytes for nine physically selected files, stable process/watchdog observations across 45-second windows, reboot, and return after switching between distinct OS closures. These observations do not establish service health, a vendor-authenticated N-to-N+1 update, whole-payload or state equality, or profile or bootloader rollback.
-
-Separately approved secret-safe enrollment and management-triggered N-to-N+1 acceptance remain future requirements. The current native mode has no credential writer or authenticated-management test, and token, customer ID, email, and serial-number settings must remain null. Even a successful lifecycle run would not establish host-hardware compatibility, protection or recovery behavior, vendor support for NixOS, or compatibility with arbitrary future packages.
+Separately approved secret-safe enrollment and management-triggered N-to-N+1 acceptance remain future requirements. The current native mode has no credential writer or authenticated-management test, and token, customer ID, email, and serial-number settings must remain null. The successful offline lifecycle does not establish service health, host-hardware compatibility, protection or recovery behavior, vendor support for NixOS, whole-payload or full-state equality, profile or bootloader rollback, or compatibility with arbitrary future packages.

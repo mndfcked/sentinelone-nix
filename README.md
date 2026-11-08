@@ -86,9 +86,9 @@ nix build path:.#checks.x86_64-linux.native-observer --no-link --no-write-lock-f
 nix build path:.#checks.x86_64-linux.native-controller --no-link --no-write-lock-file -L
 ```
 
-The bootstrap and native checks use fixtures. The controller check injects filesystem and command failures without the proprietary DEB; the synthetic backend VM checks genuine Nix roots and package operations. A separate private lifecycle run uses the owner-trusted DEB and is excluded from public CI. See [evidence and remaining work](docs/linux-package-upgrade-decision.md#evidence-and-remaining-work) for earlier public-suite results and the pending real-artifact lifecycle result. Fixture checks do not prove enrollment, vendor authenticity, or a vendor-supported N-to-N+1 update.
+See [offline validation](docs/native-offline-validation.md) for the current public-suite and complete real-artifact lifecycle results.
 
-Current work is paused for handoff. The latest actual-DEB module run passed a 45-second bootstrap window and one local same-DEB upgrade, then host ENOSPC interrupted report saving after 11 post-upgrade samples. The full post-upgrade window, nine-file after-comparison, reboot, and closure-switch checks did not finish. A later capacity preflight stopped before starting a VM. The current candidate's complete 35-check public suite and new remote CI are still pending. See the [decision and evidence](docs/linux-package-upgrade-decision.md#evidence-and-remaining-work) for the completed focused checks and limits.
+The actual-DEB module lifecycle passed using the isolated integration candidate's Nixpkgs, exact Zen kernel, and runtime inputs: one same-DEB replacement, a real `dpkg` exec witness, nine physical file replacements with unchanged bytes, five 45-second watchdog windows, reboot persistence, and a distinct-closure switch and return. All nine explicit public check attributes, the separate formatting check, and scoped Pyright passed. See [offline validation](docs/native-offline-validation.md) for revision-bound evidence, reproduction steps, and limits. Exact delivery-head CI is recorded in the PR; local checks do not establish remote CI success.
 
 For pinned checkout, installer, updater, advisory, and token-handling details, see [CI security](docs/ci-security.md).
 
