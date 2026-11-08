@@ -2,101 +2,117 @@
 
 ## About
 
-Package and module to use SentinelOne on NixOS. Based on the SentinelOne package from [GitLab](https://gitlab.com/gitlab-com/gl-infra/reliability).
+NixOS package and module for SentinelOne, based on the SentinelOne package from [GitLab](https://gitlab.com/gitlab-com/gl-infra/reliability).
 
 ## Production status
 
-The store-managed module still runs package binaries from the immutable Nix store and uses read-only component bind mounts. Bootstrap hardening does not make the integration ready to re-enable. Keep `services.sentinelone.enable` disabled; production automatic upgrades remain unsupported.
+The store-managed legacy module remains the default. Its package in [package.nix](package.nix) is still version 24.3.3.1 from the existing third-party source. The native changes leave `package.nix` and `bootstrap.py` unchanged. The legacy package source and version were not re-vetted in this work. Keep `services.sentinelone.enable = false` on live hosts.
 
-Bootstrap now protects generated credentials, publishes initialized state atomically, and handles the legacy customer ID fallback. It refuses unknown existing state and package mismatches. These changes do not remediate any prior credential exposure. A vendor updater contract, update provenance checks, and real vendor-package validation remain deployment blockers. Any vendor-package smoke test must run in a disposable VM without a token or network access.
+`services.sentinelone.vendorManagedUpdates = true` selects an experimental, default-off, unenrolled native mode for a local vendor-managed payload. Native credential application and an update downloader are not implemented; authenticated management remains unverified. Production automatic updates remain on HOLD pending separately approved secret-safe enrollment and a management-triggered N-to-N+1 test. See the [Linux package and upgrade decision](docs/linux-package-upgrade-decision.md).
 
-## CI and lock updates
+## Modes
 
-See [CI security](docs/ci-security.md) for the pinned checkout, installer, and updater commits, advisory audit, accepted residual risks, and token provisioning and verification.
+### Store-managed legacy
 
-## Store-managed bootstrap
+Legacy remains the default mode. It runs package binaries from the immutable Nix store and uses read-only component bind mounts. The existing `bootstrap.py`, token handling, and customer-ID behavior remain unchanged.
 
-Initialization validates the package seed and runtime token before creating persistent bootstrap state. It copies into a root-owned `0700` staging directory beside `dataDir`, preserves copied directory permissions and executable bits, and writes generated credential files as root-owned `0600` files. A serialized root-only lock sits outside the installation. The helper publishes the completed tree with a same-filesystem rename. The base mount, read-only component mounts, and daemon all require successful initialization.
+When legacy mode is enabled, `sentinelOneManagementTokenPath` is required. It accepts a canonical absolute runtime string without Nix store context. Nix path values and store-backed strings are rejected. A secret manager's runtime `.path` string remains supported. The token source must be a regular file with no group or other permissions, such as mode `0400` or `0600`. Runtime secret-manager symlinks and private files owned by the configured secret recipient are supported. The initializer does not change source permissions or ownership.
 
-`sentinelOneManagementTokenPath` and `dataDir` accept canonical absolute runtime strings outside `/nix/store`. Nix path values and strings with store context are rejected to prevent copying credentials or persistent data into the store. A secret manager's runtime `.path` string remains supported. The token source must be a regular file with no group/other permissions, such as mode `0400` or `0600`. Runtime secret-manager symlinks and private files owned by the configured secret recipient are supported. The initializer never fixes the source file's permissions or ownership.
+The token must contain a single-line base64 encoding of one JSON object with nonempty string `url` and `site_key` fields. One trailing newline is accepted. Embedded token newlines and control characters in decoded fields are rejected. Token bytes are read only during initialization and are not passed through command arguments, environment variables, or diagnostics.
 
-The token must contain single-line base64 encoding of one JSON object with nonempty string `url` and `site_key` fields. One trailing newline in the token file is accepted. Embedded token newlines and control characters in decoded fields are rejected. Token bytes are read only at initialization and never passed through command arguments, environment variables, or diagnostics.
+The destination may be absent or an empty root-owned directory. Its parent must already exist. The destination and its ancestors must be real root-owned directories without group or other write access. Symlinks and nested mounts are refused. The base bind mount uses private propagation so component mounts do not appear inside the persistent source tree.
 
-The destination may be absent or an empty root-owned directory. Its parent must already exist. The destination and its ancestors must be real root-owned directories without group/other write access; symlinks and nested mounts are refused. The base bind mount uses private propagation so component mounts do not appear inside the persistent source tree.
-
-### Existing state and package changes
-
-This is a breaking change for existing installations: nonempty state without a valid `.sentinelone-bootstrap.json` marker is refused unchanged. Legacy or partial installations are never adopted, deleted, migrated, or re-enrolled automatically. For example, an old unmarked `/var/lib/sentinelone` prevents the daemon and its mounts from starting. Inspect the refusal with:
+Existing nonempty state without a valid `.sentinelone-bootstrap.json` marker is refused unchanged. Legacy or partial installations are never adopted, deleted, migrated, or re-enrolled automatically. For example, an old unmarked `/var/lib/sentinelone` prevents the daemon and its mounts from starting. Inspect a refusal with:
 
 ```sh
 journalctl -u sentinelone-init.service
 ```
 
-Preserve the existing tree and request an explicit operator migration or upgrade plan. Do not delete state or add a marker to bypass the refusal. Interrupted staging directories also require operator review; the helper only cleans staging created by its own invocation.
+Preserve the existing tree and request an explicit operator migration or upgrade plan. Do not delete state or add a marker to bypass the refusal. Interrupted staging directories also require operator review. The helper only cleans staging created by its own invocation.
 
-The marker records a schema and the exact store package identity. A matching marker permits startup without rereading the original token, including after enrollment consumes its bootstrap files. A different package identity or malformed marker prevents startup without changing existing contents, permissions, or ownership. The marker does not verify a vendor signature, enrollment health, or the installed vendor version.
+The marker records a schema and the exact store package identity. A matching marker permits startup without rereading the original token, including after enrollment consumes its bootstrap files. A different package identity or malformed marker prevents startup without changing existing contents, permissions, or ownership. The marker does not verify a vendor signature, enrollment health, or installed vendor version.
 
-### Bootstrap regression checks
+### Experimental native mode
 
-Run each check separately from the repository root:
+Backward compatibility with legacy configurations is not guaranteed.
+
+Native mode is selected with `services.sentinelone.vendorManagedUpdates = true`. It requires the NixOS `system.preSwitchChecks` API. When the service is enabled in native mode:
+
+- `sentinelOneManagementTokenPath` must be null. The option now has a nullable type and a null default, while legacy mode still requires a token path when enabled.
+- `customerId`, `email`, and `serialNumber` must all be null. Native mode rejects these settings rather than ignoring them.
+- `dataDir` must not overlap `/var/lib/sentinelone-nix` or `/nix/var/nix/gcroots/sentinelone-nix`, in either direction.
+
+Native mode does not enroll the agent. Vendor credential application is not implemented. Do not pass a token through the CLI, invent another input method, or reuse the legacy bootstrap path for native enrollment.
+
+The native controller uses the original DEB at `services.sentinelone.package.src` once to initialize fresh native state. It leaves that source untouched and does not use the patched package output from the legacy derivation. The vendor installer and updater own later payload versions and the current protected vendor unit; later boots do not restore the seed. The vendor package receives `S1_AGENT_CUSTOM_INSTALL_PATH=dataDir` and `S1_AGENT_CREATE_USER=false`; `/opt/sentinelone` is an exact symlink to `dataDir`. The agent runs as a host systemd service. Native mode adds no container, namespace, `nsenter`, store-agent process, or read-only payload bind mounts.
+
+The filesystem roles are separate:
+
+- Vendor payload: `dataDir`, reached through `/opt/sentinelone`.
+- Root-only controller state, lock, and private dpkg database: `/var/lib/sentinelone-nix`.
+- Nix GC roots: `/nix/var/nix/gcroots/sentinelone-nix`. They retain complete configuration, runtime, and library references. See the [transaction guard contract](docs/linux-package-upgrade-decision.md#native-mode-contract-and-limits).
+
+The private dpkg database is package-registration state. It does not make the vendor payload private. The controller uses normal `dpkg` with an isolated `DPKG_ADMINDIR`; it does not fake package state or pass force flags. It installs a runtime provider package at version 1 with unversioned `Provides: coreutils, passwd, kmod`. A future vendor package that adds versioned or unsupported dependencies fails normal package checks.
+
+The provider exposes individual global FHS links, including commands under `/usr/sbin`, `/bin/bash`, and `/usr/lib/systemd/system -> /run/systemd/system`. The initializer's umask `0022` preserves the requested public FHS directory mode `0755` and gives child `dpkg` its normal umask. Vendor-chosen directory modes, including `1700` and `0700`, remain unchanged. The controller explicitly creates root-only control directories at `0700` and state, locks, markers, and environment files at `0600`. Existing NixOS security wrappers and PAM integration remain in use. Unpatched vendor ELFs use `nix-ld` with libgcc, the C++ runtime, zlib, and elfutils. No ABI aliases or general Debian compatibility layer are provided.
+
+Initialization, provider refresh, and registration of the current vendor unit happen at boot only. Root installation commands use a fresh `HOME=/root`, `TMPDIR=/tmp`, and noninteractive Debconf. The vendor-unit drop-in sets only six runtime variables and preserves the vendor's own `HOME`, `TMPDIR`, and Debconf values. The vendor unit's umask and other policies remain unchanged. Enabling native mode on an already-running host waits until the next boot. Same-boot activation performs read-only stable-mode checks; it does not reinstall the seed or change the provider, environment, unit, or agent. Pinned provider tools and libraries refresh at the next boot. NixOS security wrappers remain owned by the current OS configuration; the native GC root does not freeze their implementation.
+
+The existing vendor watchdog, restart, and manual-stop policy is preserved. This mode does not provide a generic repair, adoption, or uninstall path.
+
+Unknown, missing, unsafe, legacy, or interrupted state and conflicting global FHS slots fail closed. Native control and GC-root metadata names remain reserved; ambiguous state is refused. The controller does not clean state, adopt an installation, or reseed after an error.
+
+The pre-switch hook checks both the current persistent systemd tree and the desired configuration's assembled `etc/systemd/system` tree, using the new configuration path supplied by NixOS as `$1`. A `sentinelone.service` or `sentinelone.service.d` entry blocks native mode, including package-provided drop-ins, empty directories, masks, and dangling symlinks. Missing, unsafe, out-of-store, or unreadable desired trees fail closed before activation or service stops. Manual `preflight CONFIG` checks only the current tree; `preflight CONFIG --system NEW_SYSTEM` also checks the desired tree.
+
+While the module remains imported, its pre-switch check vetoes disabling native mode, changing backend, or changing `dataDir` when native state exists. Entering native mode rejects any existing payload, including legacy state. Removing the module entirely cannot be intercepted. Historical Nixpkgs, profile, and bootloader rollback behavior has not been proved. A Nix generation rollback does not roll back mutable agent state.
+
+Preserve the payload, controller database, GC roots, and evidence after an error. Recovery requires an operator-approved vendor stop and recovery plan. Do not add markers, delete state, or force dependencies to bypass a refusal.
+
+The checks assume a trusted root-managed filesystem and mount namespace, and a trusted vendor installer, updater, and service account. Path, Unix ownership, and checks on the private dpkg database path do not authenticate who wrote the current unit bytes, prove freshness, or prevent rollback. They cannot defend against a compromised vendor account during its ownership-change window or a process holding a retained writable file descriptor.
+
+## Checks
+
+Run public checks separately from the repository root. These commands build checks and do not activate a NixOS configuration.
 
 ```sh
 nix build path:.#checks.x86_64-linux.bootstrap --no-link --no-write-lock-file -L
 nix build path:.#checks.x86_64-linux.vmtest --no-link --no-write-lock-file -L
-```
-
-These checks use synthetic packages and fake runtime tokens. They cover credential confidentiality, failed initialization and retry, preservation of refused state, marker/package compatibility, service and mount dependencies, and modern and deprecated customer ID options. The fixtures do not validate real vendor enrollment or updates.
-
-## Development runtime probe
-
-Run from the repository root:
-
-```sh
 nix build path:.#checks.x86_64-linux.vendor-runtime --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.ci-policy --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.native-options --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.native-runtime --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.native-backend --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.native-observer --no-link --no-write-lock-file -L
+nix build path:.#checks.x86_64-linux.native-controller --no-link --no-write-lock-file -L
 ```
 
-The check builds unpatched, source-built distro-style ELF fixtures and shared libraries, then runs them in a NixOS VM. It exercises the conventional `/lib64/ld-linux-x86-64.so.2` interpreter with explicit systemd `NIX_LD` and `NIX_LD_LIBRARY_PATH`, and checks direct, bundled, transitive, and loader-fallback library resolution and precedence. It also checks distro-style and trusted Nix-packaged child execution, confirms the service and its distro child share the VM's PID and mount namespaces, and expects failure when a required SONAME filename is missing. A synthetic A-to-B executable replacement remains B after service restart and VM reboot. An admin fixture succeeds after the service is stopped.
+See [offline validation](docs/native-offline-validation.md) for the current public-suite and complete real-artifact lifecycle results.
 
-Without the explicit `NIX_LD` variables, the distro-style fixture still executes through the global fallback but selects a different library (`941` instead of the expected `45`). This confirms the need for the explicit service environment in this setup, not general ELF compatibility.
+The actual-DEB module lifecycle passed using the isolated integration candidate's Nixpkgs, exact Zen kernel, and runtime inputs: one same-DEB replacement, a real `dpkg` exec witness, nine physical file replacements with unchanged bytes, five 45-second watchdog windows, reboot persistence, and a distinct-closure switch and return. All nine explicit public check attributes, the separate formatting check, and scoped Pyright passed. See [offline validation](docs/native-offline-validation.md) for revision-bound evidence, reproduction steps, and limits. Exact delivery-head CI is recorded in the PR; local checks do not establish remote CI success.
 
-The check does not run the production initializer or updater, switch a NixOS generation, or validate real SentinelOne binaries, enrollment, eBPF, Live Security Update, or update signatures.
+For pinned checkout, installer, updater, advisory, and token-handling details, see [CI security](docs/ci-security.md).
 
 ## Usage
 
-To use this module, add it to your flake inputs as
+Add this repository as a flake input and pin a reviewed revision:
 
-```
+```nix
 inputs.sentinelone.url = "github:mndfcked/sentinelone-nix";
 ```
 
-Pin a reviewed revision before deployment.
+Import the module and keep the service disabled on live hosts:
 
-Then, import and use the module in your NixOS configuration as
-
-```
+```nix
 imports = [
-    inputs.sentinelone.nixosModules.sentinelone
+  inputs.sentinelone.nixosModules.sentinelone
 ];
+
 services.sentinelone = {
   enable = false;
+  vendorManagedUpdates = false;
   sentinelOneManagementTokenPath = "/run/secrets/s1_mgmt_token";
   customerId = "example-customer-id";
 };
 ```
 
-The module overlay provides `pkgs.sentinelone`. The `services.sentinelone.package` option can be overridden with `overrideAttrs` for a locally sourced package. See the [Linux package and upgrade decision](docs/linux-package-upgrade-decision.md) for the current candidate, provenance limits, and local example. Keep the service disabled; the candidate has not been validated for production.
-
-`sentinelOneManagementTokenPath` could be from a [sops-nix](https://github.com/Mic92/sops-nix) secret such as
-
-```
-sops = {
-  secrets.s1_mgmt_token = {
-    sopsFile = ../../secrets/sentinelone.yaml;
-    mode = "0600";
-  };
-};
-services.sentinelone = {
-  sentinelOneManagementTokenPath = config.sops.secrets.s1_mgmt_token.path;
-};
-
-```
+The module overlay provides `pkgs.sentinelone`. The `services.sentinelone.package` option can be overridden for local testing. See the [disabled native configuration example](docs/linux-package-upgrade-decision.md#local-source-example) for the owner-trusted candidate, its provenance limits, and the one-time local fixed-store import.
