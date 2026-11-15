@@ -90,10 +90,12 @@ in
           type = types.bool;
           default = false;
           description = ''
-            EXPERIMENTAL native, unenrolled offline platform using the original
-            package.src DEB and vendor-managed mutable payload. Native support
-            for the default v24 package is not established. No enrollment,
-            authenticated upgrades, or production managed-update support is claimed.
+            EXPERIMENTAL native platform using the original package.src DEB and
+            vendor-managed mutable payload. Optionally enrolled once at fresh
+            install from sentinelOneManagementTokenPath; enrollment is not
+            verified against the real installer. Native support for the default
+            v24 package is not established, and authenticated upgrades or
+            production managed-update support are not claimed.
           '';
         };
 
@@ -121,9 +123,10 @@ in
           type = types.nullOr runtimePath;
           default = null;
           description = ''
-            Required in legacy mode; must be null in experimental native mode.
-            Absolute runtime filename
-            Use a context-free string, for example a sops-nix or agenix secret path;
+            Absolute runtime filename of the management token file.
+            Required in legacy mode. In experimental native mode it may be null (the agent stays unenrolled)
+            or a path; the token is then read at runtime, once, when a fresh native install is created.
+            Use a context-free string, for example a sops-nix secret path;
             Nix path values and store-backed strings are rejected to avoid copying secrets into the store.
           '';
           example = "/run/secrets/s1_mgmt_token";
@@ -166,10 +169,6 @@ in
         {
           assertion = cfg.vendorManagedUpdates || cfg.sentinelOneManagementTokenPath != null;
           message = "Legacy services.sentinelone requires a non-null sentinelOneManagementTokenPath.";
-        }
-        {
-          assertion = !cfg.vendorManagedUpdates || cfg.sentinelOneManagementTokenPath == null;
-          message = "Experimental native SentinelOne is unenrolled: sentinelOneManagementTokenPath must be null.";
         }
         {
           assertion =

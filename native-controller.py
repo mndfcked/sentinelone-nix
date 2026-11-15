@@ -1,9 +1,11 @@
 """Experimental, root-only native SentinelOne lifecycle controller.
 
-No enrollment logic lives here. A successful seed is never reapplied, and every
+The only enrollment step is passing an optional runtime token file to the vendor
+installer of a fresh seed. A successful seed is never reapplied, and every
 interrupted mutation requires explicit operator investigation rather than repair.
 """
 import argparse
+import base64
 import contextlib
 import errno
 import fcntl
@@ -157,6 +159,9 @@ def load_config(path, full=False):
         require(not overlaps(data, CONTROL), "dataDir overlaps native control directory")
         require(not overlaps(data, ROOTS), "dataDir overlaps native GC root directory")
     require(not data.is_relative_to("/nix/store"), "store-backed payload")
+    token = config.get("token_path")
+    if token is not None:
+        require(not normalized(token).is_relative_to("/nix/store"), "store-backed management token path")
     if full:
         require(config["enabled"] and config["native"], "native mode is not enabled")
         for key in ("bootstrap_deb", "runtime", "runtime_deb", "dpkg", "dpkg_query",
@@ -310,8 +315,8 @@ def environment(config):
                 DEBIAN_FRONTEND="noninteractive")
 
 
-def run(argv, config, timeout=60):
-    result = subprocess.run(argv, env=environment(config), stdin=subprocess.DEVNULL,
+def run(argv, config, timeout=60, extra_env=None):
+    result = subprocess.run(argv, env=dict(environment(config), **(extra_env or {})), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             timeout=timeout, check=False)
     # Do not print maintscript output: installation output is not a safe log API.
@@ -370,12 +375,53 @@ def dpkg_locks():
             os.close(fd)
 
 
-def install(deb, config):
+def install(deb, config, token=None):
     # Wait using actual record locks, then release them before real dpkg acquires
     # its own locks. A competing writer winning that race makes dpkg fail closed.
     with dpkg_locks():
         pass
-    run([config["dpkg"], "--install", deb], config, timeout=120)
+    # The token goes only into this installer's environment (S1_AGENT_MANAGEMENT_TOKEN,
+    # the vendor installer variable), never argv, disk, state or logs.
+    run([config["dpkg"], "--install", deb], config, timeout=120,
+        extra_env={"S1_AGENT_MANAGEMENT_TOKEN": token} if token else None)
+
+
+def no_duplicate_keys(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate keys")
+    return dict(pairs)
+
+
+def read_token(path):
+    """Read the runtime management token. Errors name the path, never the content."""
+    path = str(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError as error:
+        raise Refusal("cannot open management token file " + path + ": " + os.strerror(error.errno or 0)) from None
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o077
+                and info.st_size <= 65536,
+                "management token file must be a root-owned private regular file (mode 0400 or 0600): " + path)
+        raw = os.read(fd, 65537)
+    finally:
+        os.close(fd)
+    # Same shape as the legacy bootstrap token: single-line base64 of a JSON object
+    # with nonempty url and site_key. Errors never include any content.
+    raw = raw[:-1] if raw.endswith(b"\n") else raw
+    try:
+        token = raw.decode("ascii")
+        config = json.loads(base64.b64decode(token, validate=True), object_pairs_hook=no_duplicate_keys)
+    except ValueError:
+        raise Refusal("management token file is not single-line base64 of a JSON object: " + path) from None
+    require(isinstance(config, dict) and all(
+        isinstance(config.get(key), str) and config[key].strip()
+        and not any(ord(c) < 32 or ord(c) == 127 for c in config[key])
+        for key in ("url", "site_key")),
+        "management token needs nonempty url and site_key: " + path)
+    return token
 
 
 def manifest(config):
@@ -527,6 +573,8 @@ def reconcile(config_path, config):
     fresh = state is None
     previous = None if fresh else active_config(state)
     exports_check(config, previous, fresh=fresh)
+    # Read the token before any mutation; a bad file leaves nothing behind, so a retry stays fresh.
+    token = read_token(config["token_path"]) if fresh and config.get("token_path") else None
     mkdir(CONTROL)
     with controller_lock():
         require(not os.path.lexists(BOOT_MARK),
@@ -581,7 +629,7 @@ def reconcile(config_path, config):
             exports_check(config)
         if fresh:
             mkdir(OPT.parent, mode=0o755)
-            install(config["bootstrap_deb"], config)
+            install(config["bootstrap_deb"], config, token)
         with dpkg_locks():
             installed(config, "sentinelagent")
             content = payload_check(config)

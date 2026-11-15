@@ -4,6 +4,7 @@ The synthetic VM covers real nix-store/dpkg/systemd. Here only subprocesses,
 store-file reads and host ownership/ancestors are substituted. Controller state,
 atomic publication, root layouts and failure/refusal behavior use real files.
 """
+import base64
 import contextlib
 import importlib.util
 import json
@@ -32,6 +33,8 @@ class Injected(OSError):
 
 
 class Fixture:
+    token: Path  # set by NativeToken.fixture
+
     def __init__(self, fresh=False, fault=None, same_config=False):
         self.stack = contextlib.ExitStack()
         try:
@@ -45,6 +48,7 @@ class Fixture:
         self.fault = fault
         self.hit = False
         self.events = []
+        self.envs = []
         self.owners = {}
         self.vendor_uid = 998
         self.stack.enter_context(patch.object(pwd, "getpwnam", return_value=pwd.struct_passwd(
@@ -238,6 +242,7 @@ class Fixture:
             assert pending["phase"] == "pending"
             assert str(self.config_path) in self.targets(), "package mutation without new root"
             assert (self.roots / "transaction").is_symlink(), "package mutation without guard"
+            self.envs.append((argv[-1], kwargs.get("env", {}), argv))
             if argv[-1] == SEED:
                 self.events.append("seed")
                 self.payload()
@@ -279,6 +284,135 @@ class Fixture:
         return {str(p.relative_to(self.base)):
                 (p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None)
                 for p in self.base.rglob("*")}
+
+
+TOKEN_ENV = "S1_AGENT_MANAGEMENT_TOKEN"
+DUMMY = base64.b64encode(json.dumps(
+    {"url": "http://fixture.invalid", "site_key": "dummy-site-key"}).encode()).decode()
+
+
+def encoded(value):
+    return base64.b64encode(json.dumps(value).encode()).decode()
+
+
+class NativeToken(unittest.TestCase):
+    @contextlib.contextmanager
+    def fixture(self, token: str | None = DUMMY + "\n", mode=0o600, **kwargs):
+        # Fixture patches stack, so each one is closed before the next is made.
+        fixture = Fixture(**kwargs)
+        try:
+            fixture.token = fixture.base / "secrets" / "s1_mgmt_token"
+            fixture.config["token_path"] = str(fixture.token)
+            if token is not None:
+                fixture.token.parent.mkdir()
+                fixture.token.write_text(token)
+                fixture.token.chmod(mode)
+            yield fixture
+        finally:
+            fixture.close()
+
+    def test_fresh_seed_gets_token_only_through_installer_environment(self):
+        with self.fixture(fresh=True) as fixture:
+            fixture.reconcile()
+            seen = {deb: (env, argv) for deb, env, argv in fixture.envs}
+            self.assertEqual(DUMMY, seen[SEED][0][TOKEN_ENV])
+            for deb, (env, argv) in seen.items():
+                self.assertNotIn(DUMMY, " ".join(argv))
+                if deb != SEED:
+                    self.assertNotIn(TOKEN_ENV, env)
+            self.assertNotIn(TOKEN_ENV, controller.environment(fixture.config))
+            self.assertNotIn(TOKEN_ENV, controller.runtime_environment(fixture.config))
+            for path in fixture.base.rglob("*"):
+                if path.is_file() and path != fixture.token:
+                    self.assertNotIn(DUMMY.encode(), path.read_bytes(), str(path))
+
+    def test_existing_state_is_never_reenrolled_or_reads_the_token(self):
+        with self.fixture(token=None) as fixture:
+            fixture.reconcile()
+            self.assertNotIn("seed", fixture.events)
+            self.assertTrue(all(TOKEN_ENV not in env for _, env, _ in fixture.envs))
+
+    def test_no_token_path_keeps_unenrolled_seed(self):
+        with self.fixture(fresh=True) as fixture:
+            fixture.config["token_path"] = None
+            fixture.reconcile()
+            self.assertEqual(1, fixture.events.count("seed"))
+            self.assertTrue(all(TOKEN_ENV not in env for _, env, _ in fixture.envs))
+
+    def test_bad_token_file_fails_closed_naming_path_not_content(self):
+        secret = "leaked-secret-9"
+        cases = {
+            "missing": dict(token=None),
+            "empty": dict(token=""),
+            "newline-only": dict(token="\n"),
+            "multiline": dict(token=secret + "\n" + secret + "\n"),
+            "inner-space": dict(token=secret + " " + secret),
+            "control": dict(token=secret + "\x01"),
+            "group-readable": dict(token=DUMMY, mode=0o640),
+            "bad-base64": dict(token=secret + "!"),
+            "not-json": dict(token=base64.b64encode(secret.encode()).decode()),
+            "json-list": dict(token=encoded([secret])),
+            "no-site-key": dict(token=encoded({"url": "http://" + secret})),
+            "empty-url": dict(token=encoded({"url": " ", "site_key": secret})),
+            "non-string-site-key": dict(token=encoded({"url": "u", "site_key": 7})),
+            "duplicate-key": dict(token=base64.b64encode(
+                ('{"url": "u", "site_key": "k", "site_key": "' + secret + '"}').encode()).decode()),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                with self.fixture(fresh=True, **kwargs) as fixture:
+                    with self.assertRaises(controller.Refusal) as caught:
+                        fixture.reconcile()
+                    self.assertIn(str(fixture.token), str(caught.exception))
+                    self.assertNotIn(secret, str(caught.exception))
+                    self.assertEqual([], fixture.events)
+                    self.assertFalse(fixture.paths["STATE"].exists())
+                    self.assertFalse(fixture.paths["BOOT_MARK"].exists())
+                    self.assertFalse(fixture.roots.exists())
+                    # Nothing was consumed: fixing the file permits a clean retry.
+                    fixture.token.parent.mkdir(exist_ok=True)
+                    fixture.token.write_text(DUMMY)
+                    fixture.token.chmod(0o600)
+                    fixture.reconcile()
+                    self.assertEqual(1, fixture.events.count("seed"))
+
+    def test_token_owned_by_non_root_is_refused(self):
+        with self.fixture(fresh=True) as fixture:
+            fixture.owners[fixture.token.stat().st_ino] = 1000
+            with self.assertRaises(controller.Refusal) as caught:
+                fixture.reconcile()
+            self.assertIn(str(fixture.token), str(caught.exception))
+            self.assertEqual([], fixture.events)
+
+    def test_sops_layout_symlinked_directory_and_0400_file(self):
+        with self.fixture(fresh=True, token=None) as fixture:
+            real = fixture.base / "secrets.d" / "1"
+            real.mkdir(parents=True)
+            (real / "s1_mgmt_token").write_text(DUMMY)
+            (real / "s1_mgmt_token").chmod(0o400)
+            link = fixture.base / "secrets"
+            link.symlink_to(real)
+            fixture.config["token_path"] = str(link / "s1_mgmt_token")
+            fixture.reconcile()
+            seed = [env for deb, env, _ in fixture.envs if deb == SEED]
+            self.assertEqual(DUMMY, seed[0][TOKEN_ENV])
+
+    def test_token_directory_is_refused(self):
+        with self.fixture(fresh=True, token=None) as fixture:
+            fixture.token.mkdir(parents=True)
+            with self.assertRaises(controller.Refusal):
+                fixture.reconcile()
+            self.assertEqual([], fixture.events)
+
+    def test_token_path_must_be_a_runtime_path(self):
+        with self.fixture(fresh=True) as fixture:
+            path = fixture.base / "candidate.json"
+            for value in ("/nix/store/secret", "relative/token", "/run/../token", 7):
+                path.write_text(json.dumps(dict(fixture.config, token_path=value)))
+                with self.subTest(value=value), self.assertRaises(controller.Refusal):
+                    controller.load_config(path)
+            path.write_text(json.dumps(dict(fixture.config, token_path=None)))
+            self.assertIsNone(controller.load_config(path)["token_path"])
 
 
 class PayloadTests(unittest.TestCase):

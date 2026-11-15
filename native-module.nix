@@ -24,6 +24,7 @@ let
       enabled = true;
       native = true;
       data_dir = cfg.dataDir;
+      token_path = cfg.sentinelOneManagementTokenPath;
       bootstrap_deb = toString cfg.package.src;
       runtime = toString provider.runtime;
       runtime_deb = toString provider.deb;

@@ -26,6 +26,14 @@ let
         #!/bin/sh
         set -eu
         test "$S1_AGENT_CREATE_USER" = false
+        # Only the fresh seed install may receive the runtime-generated test token.
+        if test "${version}" = 1; then
+          test -n "$S1_AGENT_MANAGEMENT_TOKEN"
+          test "$S1_AGENT_MANAGEMENT_TOKEN" = "$(cat /run/s1-token)"
+          echo applied > /run/native-token-applied
+        else
+          test -z "$(printenv S1_AGENT_MANAGEMENT_TOKEN || true)"
+        fi
         if test "${version}" = 1; then
           test "$HOME" = /root
           umask > /run/native-dpkg-umask
@@ -113,6 +121,27 @@ let
       vendorManagedUpdates = true;
       inherit package;
       dataDir = "/var/lib/native-payload";
+      sentinelOneManagementTokenPath = lib.mkDefault "/run/s1-token";
+    };
+    # Dummy token made at runtime, so its value is never in the Nix store.
+    systemd.services.native-token-fixture = {
+      wantedBy = [ "multi-user.target" ];
+      requiredBy = [ "sentinelone-init.service" ];
+      before = [ "sentinelone-init.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        UMask = "0077";
+      };
+      # sops-nix layout: a 0400 root file in a numbered directory, reached by a symlink.
+      # The token is structurally valid (base64 JSON with url and site_key) but random.
+      script = ''
+        mkdir -p /run/s1-secrets.d/1
+        key=$(head -c 24 /dev/urandom | base64 -w0 | tr '+/=' 'abc')
+        printf '{"url":"http://fixture.invalid","site_key":"%s"}' "$key" | base64 -w0 > /run/s1-secrets.d/1/token
+        chmod 0400 /run/s1-secrets.d/1/token
+        ln -sfn /run/s1-secrets.d/1/token /run/s1-token
+      '';
     };
     environment.systemPackages = [
       pkgs.python3
@@ -272,6 +301,19 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("sentinelone.service")
     machine.wait_until_succeeds("test -s " + root + "/data/starts")
     payload_layout()
+    # The vendor installer received the dummy SOPS-style token (its preinst compares it
+    # with /run/s1-token). It must not reach the store, journal, state or the running agent.
+    machine.succeed("test -e /run/native-token-applied")
+    token = shlex.quote(machine.succeed("cat /run/s1-token").strip())
+    machine.fail("journalctl -b --no-pager | grep -F -- " + token)
+    machine.succeed("test -L /run/s1-token")
+    # -q: a match still fails the test even if another file could not be read.
+    machine.fail("grep -rqF -- " + token + " $(nix-store -qR /run/current-system)")
+    machine.fail("grep -rqF -- " + token + " /var/lib/native-payload /var/lib/sentinelone-nix /run/systemd/system /run/sentinelone-nix-boot-config")
+    agent_pid = machine.succeed("systemctl show -p MainPID --value sentinelone.service").strip()
+    assert agent_pid.isdecimal() and int(agent_pid) > 0, agent_pid
+    machine.succeed("test -r /proc/" + agent_pid + "/environ")
+    machine.fail("tr '\\0' '\\n' < /proc/" + agent_pid + "/environ | grep -qF -- " + token)
     initial = state()
     assert initial["phase"] == "ready" and initial["seed"]["version"] == "1"
     assert initial["mode"] == "vendor-managed"

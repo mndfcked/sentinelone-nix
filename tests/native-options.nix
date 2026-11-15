@@ -77,7 +77,26 @@ let
     ) oldNative.assertions)
     (!(valid { enable = true; }))
     (valid native)
-    (!(valid (native // { sentinelOneManagementTokenPath = "/run/secrets/s1"; })))
+    (valid (native // { sentinelOneManagementTokenPath = "/run/secrets/s1"; }))
+    (
+      !(valid (
+        native
+        // {
+          sentinelOneManagementTokenPath = "/run/secrets/s1";
+          customerId = "legacy";
+        }
+      ))
+    )
+    (
+      !(valid (
+        native
+        // {
+          sentinelOneManagementTokenPath = "/run/secrets/s1";
+          email = "legacy";
+          serialNumber = "legacy";
+        }
+      ))
+    )
     (badType (native // { sentinelOneManagementTokenPath = "/nix/store/unsafe-secret"; }))
     (badType (base // { sentinelOneManagementTokenPath = pkgs.writeText "not-a-secret" ""; }))
     (!(valid (native // { package = sourceLessPackage; })))
